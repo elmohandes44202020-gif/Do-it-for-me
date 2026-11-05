@@ -15,17 +15,21 @@ import hashlib
 import hmac
 import os
 import queue
+import platform
 import shutil
+import sys
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+import av as _av
 import media
 import zipstream
 
@@ -85,8 +89,21 @@ class FileSpec(BaseModel):
 class JobRequest(BaseModel):
     files: list[FileSpec] = Field(min_length=1)
     cookie: str | None = None          # كوكي مشترك لكل الملفات
-    user_agent: str | None = None
+    user_agent: str | None = None      # يُمرَّر من التطبيق = نفس UA الجهاز
+    referer: str | None = None         # صفحة الدفتر — جوجل تتحقق منها أحيانًا
     zip_name: str = "notebooklm-audio"
+
+
+class CookieVariant(BaseModel):
+    label: str = ""
+    cookie: str | None = None
+
+
+class DiagnoseRequest(BaseModel):
+    url: str
+    cookies: list[CookieVariant] = Field(default_factory=list)
+    user_agent: str | None = None
+    referer: str | None = None
 
 
 class ProbeRequest(BaseModel):
@@ -263,6 +280,10 @@ def _startup() -> None:
 def healthz() -> dict:
     return {
         "ok": True,
+        "service": "notebooklm-mp3",
+        "version": "0.2.0",
+        "python": sys.version.split()[0],
+        "pyav": getattr(_av, "__version__", "?"),
         "jobs": len(JOBS),
         "queued": QUEUE.qsize(),
         "auth_configured": bool(KEYS),
@@ -287,6 +308,84 @@ def probe(req: ProbeRequest, _owner: str = Depends(auth)) -> dict:
     return out
 
 
+def _verdict(attempts: list[dict]) -> dict:
+    """قراءة النتائج وترجمتها إلى توصية واحدة واضحة."""
+    ok_variants = [a for a in attempts if a.get("ok")]
+    statuses = [a.get("status") for a in attempts]
+    any_cookie_ok = any(a.get("ok") for a in ok_variants if a.get("cookie_len", 0) > 0)
+    no_cookie_ok = any(a.get("ok") for a in ok_variants if a.get("cookie_len", 0) == 0)
+
+    if no_cookie_ok:
+        return {
+            "code": "link-public",
+            "arabic": "الرابط يُنزَّل من السيرفر بدون أي كوكيز. لو المهمة فشلت رغم ذلك فالمشكلة في التحويل أو في الرابط نفسه لا في الصلاحيات.",
+            "english": "The URL is downloadable server-side without cookies; a job failure is then about the link or transcoding, not auth.",
+        }
+    if any_cookie_ok:
+        return {
+            "code": "cookie-required",
+            "arabic": "الرابط يحتاج كوكيز. أعد إرسال المهمة مع تعليم مربّع الكوكيز، وتأكد أن الكوكي المُرسل هو كوكي حساب جوجل (نطاق .google.com) لا كوكي نطاق الصوت.",
+            "english": "Cookie required. Resubmit with cookies enabled — and send the .google.com account cookies, not the media-host ones.",
+        }
+    if all(s == 403 for s in statuses if s):
+        return {
+            "code": "google-blocks-server-ip",
+            "arabic": "جوجل ترد 403 على كل المحاولات حتى مع الكوكيز: الرابط مربوط بجلسة/جهاز طالب مختلف، أو الجلسة انتهت. الحل العملي: نزّل على الهاتف ثم حوّل على السيرفر، أو أعد الاكتشاف لتحصل على رابط جديد وأرسله فورًا.",
+            "english": "Google answers 403 for every attempt: the URL is bound to a different session/device or expired. Re-discover for a fresh URL, or download on-device and convert server-side.",
+        }
+    if all(s == 404 for s in statuses if s):
+        return {
+            "code": "expired",
+            "arabic": "الرابط منتهي الصلاحية (404). أعد الاكتشاف في NotebookLM لتحصل على رابط جديد.",
+            "english": "Expired link (404). Re-run discovery to get a fresh URL.",
+        }
+    if any(a.get("content_type", "") and "html" in str(a.get("content_type")).lower() for a in attempts):
+        return {
+            "code": "login-page",
+            "arabic": "جوجل تعيد صفحة HTML (تسجيل دخول) بدل الصوت: الجلسة غير صالحة لهذا الرابط. أعد تسجيل الدخول في التطبيق ثم أعد الاكتشاف.",
+            "english": "Google returns an HTML login page instead of audio: session invalid for this URL. Sign in again and re-discover.",
+        }
+    return {
+        "code": "unknown",
+        "arabic": "النتائج غير حاسمة. أرسل التقرير كما هو.",
+        "english": "Inconclusive. Send the report as is.",
+    }
+
+
+@app.post("/diagnose")
+def diagnose(req: DiagnoseRequest, owner: str = Depends(auth)) -> dict:
+    """تشخيص شامل للرابط: عدة محاولات بكوكيز مختلفة + توصية نهائية."""
+    variants = req.cookies or [CookieVariant(label="no-cookie", cookie=None)]
+    attempts: list[dict] = []
+    for v in variants:
+        r = media.probe(req.url, cookie=v.cookie, user_agent=req.user_agent, referer=req.referer)
+        r["label"] = v.label or ("cookie" if v.cookie else "no-cookie")
+        r["cookie_len"] = len(v.cookie or "")
+        attempts.append(r)
+    host = ""
+    try:
+        host = urlparse(req.url).hostname or ""
+    except ValueError:
+        pass
+    return {
+        "url_len": len(req.url),
+        "host": host,
+        "host_allowed": media.host_allowed(req.url),
+        "has_query": "?" in req.url,
+        "user_agent_sent": bool(req.user_agent),
+        "referer_sent": bool(req.referer),
+        "server": {
+            "service": "notebooklm-mp3",
+            "version": "0.2.0",
+            "python": sys.version.split()[0],
+            "platform": platform.platform(),
+            "pyav": getattr(_av, "__version__", "?"),
+        },
+        "attempts": attempts,
+        "verdict": _verdict(attempts),
+    }
+
+
 @app.post("/jobs", status_code=202)
 def create_job(req: JobRequest, owner: str = Depends(auth)) -> dict:
     if not KEYS:
@@ -303,7 +402,7 @@ def create_job(req: JobRequest, owner: str = Depends(auth)) -> dict:
             title=spec.title or "",
             url=spec.url,
             cookie=spec.cookie,
-            referer=spec.referer,
+            referer=spec.referer or req.referer,
             bitrate=spec.bitrate or MP3_BITRATE,
             mono=MP3_MONO if spec.mono is None else spec.mono,
         ))

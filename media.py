@@ -83,13 +83,20 @@ def download(
     head = b""
     with httpx.Client(timeout=timeout, follow_redirects=True, http2=False) as client:
         with client.stream("GET", url, headers=_headers(url, cookie, user_agent, referer)) as r:
-            if r.status_code in (401, 403):
-                raise MediaError(
-                    f"HTTP {r.status_code} — جوجل رفضت الطلب بدون جلسة صالحة "
-                    "(الرابط يحتاج كوكيز أو انتهت صلاحيته)"
-                )
             if r.status_code >= 400:
-                raise MediaError(f"HTTP {r.status_code}")
+                snippet = b""
+                try:
+                    for chunk in r.iter_bytes(512):
+                        snippet += chunk
+                        if len(snippet) >= 400:
+                            break
+                except Exception:  # noqa: BLE001
+                    pass
+                txt = snippet[:200].decode("latin-1", "replace").replace("\n", " ").strip()
+                hint = ""
+                if r.status_code in (401, 403):
+                    hint = " — جوجل رفضت التنزيل من السيرفر (الرابط مرتبط بالجلسة/الجهاز؟)"
+                raise MediaError(f"HTTP {r.status_code}{hint} · body: {txt or '(فارغ)'}")
             ctype = (r.headers.get("content-type") or "").lower()
             with open(dest, "wb") as fh:
                 for block in r.iter_bytes(1 << 16):
@@ -118,10 +125,11 @@ def probe(
     user_agent: str | None = None,
     referer: str | None = None,
 ) -> dict:
-    """اختبار: هل يستطيع السيرفر تنزيل هذا الرابط؟ (بدون كوكيز أولًا)."""
-    out = {"url": url, "host_allowed": host_allowed(url)}
+    """اختبار تفصيلي: هل يستطيع السيرفر تنزيل هذا الرابط؟ وماذا يعيد جوجل بالحرف؟"""
+    out: dict = {"url": url, "host_allowed": host_allowed(url)}
     if not out["host_allowed"]:
         out["ok"] = False
+        out["error"] = "نطاق غير مسموح للسيرفر"
         return out
     try:
         with httpx.Client(timeout=30, follow_redirects=True) as client:
@@ -129,11 +137,17 @@ def probe(
                 url,
                 headers={**_headers(url, cookie, user_agent, referer), "Range": "bytes=0-2047"},
             )
-        out["status"] = r.status_code
-        out["content_type"] = r.headers.get("content-type")
-        out["content_length"] = r.headers.get("content-length")
-        body = r.content[:64]
-        out["looks_audio"] = not (body[:5].lower() == b"<!doc" or b"<html" in body.lower())
+        body = r.content[:400]
+        low = body[:64].lower()
+        out.update({
+            "status": r.status_code,
+            "final_url": str(r.url)[:300],
+            "content_type": r.headers.get("content-type"),
+            "content_length": r.headers.get("content-length"),
+            "server": r.headers.get("server"),
+            "first_bytes": body[:80].decode("latin-1", "replace").replace("\n", " ")[:80],
+            "looks_audio": not (low.startswith(b"<!doc") or b"<html" in low),
+        })
         out["ok"] = out["status"] in (200, 206) and out["looks_audio"]
     except Exception as exc:  # noqa: BLE001
         out["ok"] = False
