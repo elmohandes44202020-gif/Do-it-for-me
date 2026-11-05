@@ -52,6 +52,46 @@ def host_allowed(url: str) -> bool:
     return any(h == s or h.endswith("." + s) for s in _ALLOWED_SUFFIX)
 
 
+
+# ── اختيار الكوكيز لكل نطاق ────────────────────────────────────────────────
+# درس مهم: إرسال كوكيز نطاق .google.com إلى googleusercontent.com يجعل جوجل
+# تعيد صفحة CookieMismatch/تسجيل دخول. الكوكيز تُرسل فقط للنطاقات التي
+# أُصدرت لها، وهذا ما كان يفسد كل محاولاتنا السابقة.
+def cookie_for_host(host: str, cookie_map: dict[str, str]) -> str:
+    """أطول نطاق مطابق فقط. مثال: lh3.google.com → كوكيز google.com،
+    و lh3.googleusercontent.com → لا شيء (لأن google.com ليست لاحقة لها)."""
+    if not host or not cookie_map:
+        return ""
+    host = host.lower()
+    best = ""
+    best_len = -1
+    for domain, value in cookie_map.items():
+        if not value:
+            continue
+        d = (domain or "").lower().lstrip(".")
+        if not d:
+            continue
+        if (host == d or host.endswith("." + d)) and len(d) > best_len:
+            best = value
+            best_len = len(d)
+    return best
+
+
+def _map_from_request(cookie: str | None, cookie_map: dict[str, str] | None) -> dict[str, str]:
+    out = dict(cookie_map or {})
+    if cookie:
+        # الكوكي المسطّحة (كما يرسلها التطبيق) تُعامل ككوكيز جوجل فقط،
+        # ولا تُرسل أبدًا إلى نطاق googleusercontent.
+        out.setdefault("google.com", cookie)
+    return out
+
+
+def _cookie_names(cookie: str) -> str:
+    if not cookie:
+        return "0"
+    return str(len([c for c in cookie.split(";") if "=" in c]))
+
+
 def _headers(url: str, cookie: str | None, user_agent: str | None, referer: str | None) -> dict:
     h = {
         "User-Agent": user_agent or DEFAULT_UA,
@@ -69,89 +109,178 @@ def download(
     dest: str,
     *,
     cookie: str | None = None,
+    cookie_map: dict[str, str] | None = None,
     user_agent: str | None = None,
     referer: str | None = None,
     max_bytes: int = 400 * 1024 * 1024,
     timeout: float = 120.0,
     on_bytes: Callable[[int], None] | None = None,
 ) -> int:
-    """ينزّل الملف إلى dest بالبثّ ويعيد عدد البايتات. لا يحتفظ بأي شيء في الذاكرة."""
+    """ينزّل الملف إلى dest بالبثّ مع كوكيز صحيحة لكل قفزة، ويعيد عدد البايتات."""
     if not host_allowed(url):
         raise MediaError(f"نطاق غير مسموح: {urlparse(url).hostname}")
 
-    written = 0
-    head = b""
-    with httpx.Client(timeout=timeout, follow_redirects=True, http2=False) as client:
-        with client.stream("GET", url, headers=_headers(url, cookie, user_agent, referer)) as r:
-            if r.status_code >= 400:
-                snippet = b""
-                try:
-                    for chunk in r.iter_bytes(512):
-                        snippet += chunk
-                        if len(snippet) >= 400:
-                            break
-                except Exception:  # noqa: BLE001
-                    pass
-                txt = snippet[:200].decode("latin-1", "replace").replace("\n", " ").strip()
-                hint = ""
-                if r.status_code in (401, 403):
-                    hint = " — جوجل رفضت التنزيل من السيرفر (الرابط مرتبط بالجلسة/الجهاز؟)"
-                raise MediaError(f"HTTP {r.status_code}{hint} · body: {txt or '(فارغ)'}")
-            ctype = (r.headers.get("content-type") or "").lower()
-            with open(dest, "wb") as fh:
-                for block in r.iter_bytes(1 << 16):
-                    if not head:
-                        head = block[:64]
-                    written += len(block)
-                    if written > max_bytes:
-                        raise MediaError(f"تجاوز الحد المسموح ({max_bytes} بايت)")
-                    fh.write(block)
-                    if on_bytes:
-                        on_bytes(written)
+    r = fetch_traced(
+        url, cookie=cookie, cookie_map=cookie_map, user_agent=user_agent,
+        referer=referer, dest=dest, max_bytes=max_bytes, timeout=timeout,
+    )
+    if not r.get("ok"):
+        ct = r.get("content_type") or ""
+        raise MediaError(
+            (r.get("error") or "فشل التنزيل")
+            + f" · الحجم={r.get('bytes', 0)} · النوع={ct or '-'}"
+            + " · المسار: " + trace_summary(r)
+        )
+    size = int(r.get("bytes") or 0)
+    if on_bytes:
+        on_bytes(size)
+    return size
 
-    if written == 0:
-        raise MediaError("ملف فارغ")
-    if head[:5].lower() in (b"<!doc", b"<html") or b"<html" in head[:64].lower():
-        raise MediaError("الاستجابة صفحة HTML وليست صوتًا (تسجيل دخول مطلوب غالبًا)")
-    if ctype.startswith("audio/") or ctype == "application/octet-stream" or ctype == "":
-        return written
-    raise MediaError(f"نوع محتوى غير متوقع: {ctype}")
+
+def fetch_traced(
+    url: str,
+    *,
+    cookie: str | None = None,
+    cookie_map: dict[str, str] | None = None,
+    user_agent: str | None = None,
+    referer: str | None = None,
+    max_hops: int = 6,
+    sniff: int = 400,
+    dest: str | None = None,
+    max_bytes: int = 400 * 1024 * 1024,
+    timeout: float = 120.0,
+) -> dict:
+    """
+    يتبع التحويلات يدويًا (بلا follow_redirects) ويختار الكوكيز لكل قفزة حسب
+    نطاقها. إن مُرِّر dest يكتب جسم الاستجابة النهائية فيه (تنزيل حقيقي)،
+    وإلا يقرأ أول sniff بايت فقط (تشخيص).
+    """
+    cmap = _map_from_request(cookie, cookie_map)
+    hops: list[dict] = []
+    current = url
+    result: dict = {"ok": False, "hops": hops}
+
+    with httpx.Client(timeout=timeout, follow_redirects=False) as client:
+        for index in range(max_hops):
+            if not host_allowed(current):
+                hops.append({"hop": index + 1, "host": urlparse(current).hostname, "blocked": True})
+                result["error"] = "نطاق غير مسموح في سلسلة التحويل"
+                return result
+
+            host = urlparse(current).hostname or ""
+            ck = cookie_for_host(host, cmap)
+            headers = _headers(current, ck or None, user_agent, referer)
+            with client.stream("GET", current, headers=headers) as r:
+                ctype = (r.headers.get("content-type") or "").lower()
+                location = r.headers.get("location") or ""
+                hops.append({
+                    "hop": index + 1,
+                    "host": host,
+                    "status": r.status_code,
+                    "type": ctype or "-",
+                    "cookies": _cookie_names(ck),
+                    "location": location[:120],
+                })
+
+                if r.status_code in (301, 302, 303, 307, 308) and location:
+                    current = str(httpx.URL(current).join(location))
+                    continue
+
+                result["status"] = r.status_code
+                result["content_type"] = ctype
+                result["final_url"] = current
+                if r.status_code >= 400:
+                    snippet = b""
+                    try:
+                        for chunk in r.iter_bytes(512):
+                            snippet += chunk
+                            if len(snippet) >= sniff:
+                                break
+                    except Exception:  # noqa: BLE001
+                        pass
+                    result["error"] = (
+                        f"HTTP {r.status_code} · "
+                        + snippet[:200].decode("latin-1", "replace").replace("\n", " ").strip()
+                    )
+                    return result
+
+                fh = open(dest, "wb") if dest else None
+                written = 0
+                head = b""
+                try:
+                    for chunk in r.iter_bytes(1 << 16):
+                        if not head:
+                            head = chunk[:sniff]
+                        written += len(chunk)
+                        if written > max_bytes:
+                            result["error"] = "تجاوز الحد الأقصى للحجم"
+                            return result
+                        if fh:
+                            fh.write(chunk)
+                        elif written >= sniff:
+                            break
+                finally:
+                    if fh:
+                        fh.close()
+
+                result["bytes"] = written
+                result["first_bytes"] = head[:120].decode("latin-1", "replace").replace("\n", " ")
+                low = head[:64].lower()
+                looks_audio = not (low.startswith(b"<!doc") or b"<html" in low)
+                result["looks_audio"] = looks_audio
+                result["ok"] = looks_audio and written > 0
+                if not looks_audio:
+                    result["error"] = "الاستجابة صفحة HTML وليست صوتًا"
+                return result
+
+    result["final_url"] = current
+    result["error"] = "تحويلات كثيرة جدًا (حلقة؟)"
+    return result
+
+
+def trace_summary(result: dict) -> str:
+    """سلسلة مختصرة تُطبع في تقرير التشخيص."""
+    parts = []
+    for h in result.get("hops") or []:
+        parts.append(
+            f"#{h.get('hop')} {h.get('host', '?')} → {h.get('status', '?')} "
+            f"{h.get('type', '-')} cookies={h.get('cookies', '0')}"
+            + (f" → {h.get('location')}" if h.get("location") else "")
+        )
+    return " | ".join(parts) if parts else "لا قفزات"
 
 
 def probe(
     url: str,
     *,
     cookie: str | None = None,
+    cookie_map: dict[str, str] | None = None,
     user_agent: str | None = None,
     referer: str | None = None,
 ) -> dict:
-    """اختبار تفصيلي: هل يستطيع السيرفر تنزيل هذا الرابط؟ وماذا يعيد جوجل بالحرف؟"""
+    """اختبار تفصيلي مع تتبّع كل تحويلة وكل نطاق على حدة."""
     out: dict = {"url": url, "host_allowed": host_allowed(url)}
     if not out["host_allowed"]:
         out["ok"] = False
         out["error"] = "نطاق غير مسموح للسيرفر"
         return out
     try:
-        with httpx.Client(timeout=30, follow_redirects=True) as client:
-            r = client.get(
-                url,
-                headers={**_headers(url, cookie, user_agent, referer), "Range": "bytes=0-2047"},
-            )
-        body = r.content[:400]
-        low = body[:64].lower()
-        out.update({
-            "status": r.status_code,
-            "final_url": str(r.url)[:300],
-            "content_type": r.headers.get("content-type"),
-            "content_length": r.headers.get("content-length"),
-            "server": r.headers.get("server"),
-            "first_bytes": body[:80].decode("latin-1", "replace").replace("\n", " ")[:80],
-            "looks_audio": not (low.startswith(b"<!doc") or b"<html" in low),
-        })
-        out["ok"] = out["status"] in (200, 206) and out["looks_audio"]
+        r = fetch_traced(url, cookie=cookie, cookie_map=cookie_map,
+                         user_agent=user_agent, referer=referer, sniff=400)
     except Exception as exc:  # noqa: BLE001
         out["ok"] = False
         out["error"] = f"{type(exc).__name__}: {exc}"
+        return out
+
+    out["ok"] = bool(r.get("ok"))
+    out["status"] = r.get("status")
+    out["content_type"] = r.get("content_type")
+    out["first_bytes"] = r.get("first_bytes", "")
+    out["final_url"] = r.get("final_url") or url
+    out["trace"] = trace_summary(r)
+    out["hops"] = r.get("hops")
+    if r.get("error"):
+        out["error"] = r["error"]
     return out
 
 

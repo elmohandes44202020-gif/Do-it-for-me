@@ -25,11 +25,21 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlparse
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Request,
+    UploadFile,
+)
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 import av as _av
+import links
 import media
 import zipstream
 
@@ -80,7 +90,8 @@ def auth(x_api_key: str | None = Header(default=None)) -> str:
 class FileSpec(BaseModel):
     title: str = Field(default="", max_length=200)
     url: str
-    cookie: str | None = None          # اختياري — يُستخدم لحظيًا فقط
+    cookie: str | None = None          # كوكيز مسطّحة: تُعامل كنطاق google.com فقط
+    cookie_map: dict[str, str] | None = None   # الأفضل: كوكيز لكل نطاق على حدة
     referer: str | None = None
     bitrate: int | None = None
     mono: bool | None = None
@@ -88,7 +99,8 @@ class FileSpec(BaseModel):
 
 class JobRequest(BaseModel):
     files: list[FileSpec] = Field(min_length=1)
-    cookie: str | None = None          # كوكي مشترك لكل الملفات
+    cookie: str | None = None          # كوكي مشترك (يُعامل كنطاق google.com)
+    cookie_map: dict[str, str] | None = None   # كوكيز لكل نطاق — الأدق
     user_agent: str | None = None      # يُمرَّر من التطبيق = نفس UA الجهاز
     referer: str | None = None         # صفحة الدفتر — جوجل تتحقق منها أحيانًا
     zip_name: str = "notebooklm-audio"
@@ -102,6 +114,7 @@ class CookieVariant(BaseModel):
 class DiagnoseRequest(BaseModel):
     url: str
     cookies: list[CookieVariant] = Field(default_factory=list)
+    cookie_map: dict[str, str] | None = None
     user_agent: str | None = None
     referer: str | None = None
 
@@ -117,7 +130,7 @@ class ProbeRequest(BaseModel):
 @dataclass
 class JobFile:
     title: str
-    url: str
+    url: str | None
     cookie: str | None
     referer: str | None
     bitrate: int
@@ -130,6 +143,8 @@ class JobFile:
     mp3_path: str | None = None
     zip_name: str = ""
     crc: int = 0
+    src_path: str | None = None   # ملف مرفوع من الهاتف (المسار البديل)
+    cookie_map: dict[str, str] | None = None   # كوكيز لكل نطاق (مسار التنزيل من السيرفر)
 
 
 @dataclass
@@ -159,6 +174,11 @@ class Job:
             "active_title": running.title if running else None,
             "files": [
                 {
+                    "index": i,
+                    "download_url": (
+                        f"{base}/jobs/{self.id}/files/{i}" if f.state == "done" else None
+                    ),
+                    "name": f.zip_name or None,
                     "title": f.title,
                     "state": f.state,
                     "bytes_in": f.bytes_in,
@@ -166,7 +186,7 @@ class Job:
                     "duration_sec": f.duration_sec,
                     "error": f.error,
                 }
-                for f in self.files
+                for i, f in enumerate(self.files, start=1)
             ],
             "total_bytes_out": sum(f.bytes_out for f in self.files),
             "zip_url": f"{base}/jobs/{self.id}/zip" if self.state == "done" else None,
@@ -196,17 +216,23 @@ def _work(job_id: str) -> None:
             name = media.safe_name(f.title, index)
             dst = os.path.join(job_dir, f"{index:02d}-{name}.mp3")
             try:
-                f.state = "downloading"
-                used += media.download(
+                if f.src_path:
+                    # الملف وصل جاهزًا من الهاتف — لا حاجة لأي تنزيل من جوجل
+                    f.state = "converting"
+                    f.bytes_in = os.path.getsize(f.src_path)
+                else:
+                    f.state = "downloading"
+                    used += media.download(
                     f.url,
                     src,
-                    cookie=f.cookie or job.shared_cookie,
-                    user_agent=job.user_agent,
-                    referer=f.referer,
-                    max_bytes=min(MAX_FILE_MB * 1024 * 1024, budget - used),
-                    on_bytes=lambda n, _f=f: setattr(_f, "bytes_in", n),
-                )
-                f.state = "converting"
+                        cookie=f.cookie or job.shared_cookie,
+                        cookie_map=f.cookie_map,
+                        user_agent=job.user_agent,
+                        referer=f.referer,
+                        max_bytes=min(MAX_FILE_MB * 1024 * 1024, budget - used),
+                        on_bytes=lambda n, _f=f: setattr(_f, "bytes_in", n),
+                    )
+                    f.state = "converting"
                 info = media.m4a_to_mp3(src, dst, bitrate=f.bitrate, mono=f.mono)
                 f.duration_sec = info["duration_sec"]
                 f.bytes_out = info["bytes"]
@@ -281,7 +307,7 @@ def healthz() -> dict:
     return {
         "ok": True,
         "service": "notebooklm-mp3",
-        "version": "0.2.0",
+        "version": "0.5.0",
         "python": sys.version.split()[0],
         "pyav": getattr(_av, "__version__", "?"),
         "jobs": len(JOBS),
@@ -358,7 +384,13 @@ def diagnose(req: DiagnoseRequest, owner: str = Depends(auth)) -> dict:
     variants = req.cookies or [CookieVariant(label="no-cookie", cookie=None)]
     attempts: list[dict] = []
     for v in variants:
-        r = media.probe(req.url, cookie=v.cookie, user_agent=req.user_agent, referer=req.referer)
+        r = media.probe(
+            req.url,
+            cookie=v.cookie,
+            cookie_map=req.cookie_map if not v.cookie else None,
+            user_agent=req.user_agent,
+            referer=req.referer,
+        )
         r["label"] = v.label or ("cookie" if v.cookie else "no-cookie")
         r["cookie_len"] = len(v.cookie or "")
         attempts.append(r)
@@ -376,7 +408,7 @@ def diagnose(req: DiagnoseRequest, owner: str = Depends(auth)) -> dict:
         "referer_sent": bool(req.referer),
         "server": {
             "service": "notebooklm-mp3",
-            "version": "0.2.0",
+            "version": "0.5.0",
             "python": sys.version.split()[0],
             "platform": platform.platform(),
             "pyav": getattr(_av, "__version__", "?"),
@@ -403,6 +435,7 @@ def create_job(req: JobRequest, owner: str = Depends(auth)) -> dict:
             url=spec.url,
             cookie=spec.cookie,
             referer=spec.referer or req.referer,
+            cookie_map=spec.cookie_map or req.cookie_map,
             bitrate=spec.bitrate or MP3_BITRATE,
             mono=MP3_MONO if spec.mono is None else spec.mono,
         ))
@@ -420,6 +453,264 @@ def create_job(req: JobRequest, owner: str = Depends(auth)) -> dict:
         JOBS[job.id] = job
     QUEUE.put(job.id)
     return {"job_id": job.id, "state": job.state, "files": len(files)}
+
+
+
+# ─────────────────── ملف الروابط النصي: «انسخ الرابط وسلّمه للسيرفر» ───────────────────
+class ResolveRequest(BaseModel):
+    url: str
+    cookie: str | None = None
+    cookie_map: dict[str, str] | None = None
+    user_agent: str | None = None
+    referer: str | None = None
+
+
+@app.post("/resolve")
+def resolve_link(req: ResolveRequest, owner: str = Depends(auth)) -> dict:
+    """
+    يفتح الرابط على السيرفر ويتتبّع كل تحويلة، ثم يرجّع **الرابط النهائي الكامل**.
+    الهدف: أن ينسخ التطبيق/المستخدم هذا الرابط النهائي في ملف نصي، فيصبح رابطًا
+    جاهزًا للسيرفر بدل الرابط الأصلي الذي تعيد جوجل توجيهه لصفحة دخول.
+    لا يُنزّل الجسم كاملًا — أول 400 بايت فقط للتحقق.
+    """
+    if not media.host_allowed(req.url):
+        raise HTTPException(400, "رابط غير مسموح: النطاقات المسموحة هي نطاقات جوجل")
+    r = media.fetch_traced(
+        req.url,
+        cookie=req.cookie,
+        cookie_map=req.cookie_map,
+        user_agent=req.user_agent,
+        referer=req.referer,
+        sniff=400,
+    )
+    final_url = r.get("final_url") or req.url
+    return {
+        "ok": bool(r.get("ok")),
+        "status": r.get("status"),
+        "content_type": r.get("content_type"),
+        "looks_audio": bool(r.get("looks_audio")),
+        "final_url": final_url,
+        "final_host": urlparse(final_url).hostname,
+        "trace": media.trace_summary(r),
+        "hops": r.get("hops"),
+        "error": r.get("error"),
+        "next_step": (
+            "الرابط النهائي يعمل من السيرفر: احفظه في ملف نصي وأرسله إلى /links أو /jobs."
+            if r.get("ok") else
+            "الرابط النهائي لم يُنزَّل: جرّب /resolve مرة أخرى مع cookie_map لنطاقات جوجل، "
+            "أو استخدم /convert كمسار احتياطي."
+        ),
+    }
+
+
+class LinksRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=400_000)
+    cookie: str | None = None
+    cookie_map: dict[str, str] | None = None
+    user_agent: str | None = None
+    referer: str | None = None
+    bitrate: int | None = None
+    mono: bool | None = None
+    zip_name: str | None = None
+
+
+def _job_from_text(
+    text: str,
+    *,
+    owner: str,
+    cookie: str | None,
+    cookie_map: dict[str, str] | None,
+    user_agent: str | None,
+    referer: str | None,
+    bitrate: int | None,
+    mono: bool | None,
+    zip_name: str | None,
+    fallback_title: str = "notebooklm",
+) -> dict:
+    entries = links.parse(text, default_title="")
+    if not entries:
+        raise HTTPException(400, "لم أجد أي رابط في النص المرسل")
+
+    seen: set[str] = set()
+    specs: list[JobFile] = []
+    rejected: list[dict] = []
+    for entry in entries:
+        if entry.url in seen:
+            continue
+        seen.add(entry.url)
+        if not media.host_allowed(entry.url):
+            rejected.append({"url": entry.url[:120], "why": "نطاق غير مسموح"})
+            continue
+        specs.append(JobFile(
+            title=entry.title or f"{fallback_title}-{len(specs) + 1}",
+            url=entry.url,
+            cookie=None,
+            referer=referer,
+            bitrate=int(bitrate or MP3_BITRATE),
+            mono=MP3_MONO if mono is None else bool(mono),
+            cookie_map=cookie_map,
+        ))
+
+    if not specs:
+        raise HTTPException(400, "كل الروابط مرفوضة: " + (
+            rejected[0]["why"] if rejected else "صيغة غير مفهومة"))
+    if len(specs) > MAX_FILES:
+        raise HTTPException(400, f"الحد الأقصى {MAX_FILES} ملفًا في المهمة")
+
+    job = Job(
+        id=uuid.uuid4().hex[:12],
+        owner=owner,
+        user_agent=user_agent,
+        zip_name=media.safe_name(zip_name or "notebooklm-audio", 0, "notebooklm-audio"),
+        files=specs,
+        shared_cookie=cookie,
+    )
+    with LOCK:
+        JOBS[job.id] = job
+    QUEUE.put(job.id)
+    return {
+        "job_id": job.id,
+        "state": job.state,
+        "files": len(specs),
+        "mode": "links",
+        "titles": [f.title for f in specs],
+        "rejected": rejected,
+        "status_url": f"/jobs/{job.id}",
+    }
+
+
+@app.post("/links", status_code=202)
+def create_from_links(req: LinksRequest, owner: str = Depends(auth)) -> dict:
+    """يقبل نصًا فيه روابط (أو أزواج عنوان|رابط) ويبدأ التنزيل والتحويل مباشرة."""
+    if not req.cookie and not req.cookie_map:
+        pass  # الكوكيز اختيارية تمامًا: الرابط النهائي الموقّع غالبًا لا يحتاجها
+    return _job_from_text(
+        req.text,
+        owner=owner,
+        cookie=req.cookie,
+        cookie_map=req.cookie_map,
+        user_agent=req.user_agent,
+        referer=req.referer,
+        bitrate=req.bitrate,
+        mono=req.mono,
+        zip_name=req.zip_name,
+    )
+
+
+@app.post("/links/file", status_code=202)
+def create_from_link_file(
+    file: UploadFile = File(...),
+    meta: str = Form("{}"),
+    owner: str = Depends(auth),
+) -> dict:
+    """نفس /links لكن الملف النصي نفسه يُرفع (links.txt) — كما طلب المستخدم."""
+    import json as _json
+
+    try:
+        cfg = _json.loads(meta or "{}")
+    except Exception:  # noqa: BLE001
+        raise HTTPException(400, "حقل meta ليس JSON صالحًا") from None
+
+    raw = file.file.read(400_000)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        text = raw.decode("utf-8", "replace")
+    name = (file.filename or "links").rsplit(".", 1)[0][:80] or "links"
+    return _job_from_text(
+        text,
+        owner=owner,
+        cookie=cfg.get("cookie"),
+        cookie_map=cfg.get("cookie_map"),
+        user_agent=cfg.get("user_agent"),
+        referer=cfg.get("referer"),
+        bitrate=cfg.get("bitrate"),
+        mono=cfg.get("mono"),
+        zip_name=cfg.get("zip_name") or name,
+        fallback_title=name,
+    )
+
+
+@app.post("/convert", status_code=202)
+def convert_uploaded(
+    meta: str = Form("{}"),
+    files: list[UploadFile] = File(...),
+    owner: str = Depends(auth),
+) -> dict:
+    """
+    المسار المضمون: الهاتف ينزّل الملف بجلسته (التي تعمل) ويرفعه هنا،
+    فنتجاوز رفض جوجل لتنزيل السيرفر المباشر. لا كوكيز تُرسل في هذه الحالة.
+    """
+    import json as _json
+
+    try:
+        cfg = _json.loads(meta or "{}")
+    except Exception:  # noqa: BLE001
+        raise HTTPException(400, "حقل meta ليس JSON صالحًا") from None
+
+    if not files:
+        raise HTTPException(400, "لا يوجد أي ملف في الطلب")
+    if len(files) > MAX_FILES:
+        raise HTTPException(400, f"الحد الأقصى {MAX_FILES} ملفًا في المهمة")
+
+    titles = cfg.get("titles") or []
+    bitrate = int(cfg.get("bitrate") or MP3_BITRATE)
+    mono = MP3_MONO if cfg.get("mono") is None else bool(cfg.get("mono"))
+    zip_name = media.safe_name(str(cfg.get("zip_name") or "notebooklm-audio"), 0)
+
+    job = Job(
+        id=uuid.uuid4().hex[:12],
+        owner=owner,
+        user_agent=None,
+        zip_name=zip_name,
+        files=[],
+    )
+    job_dir = os.path.join(WORK_DIR, job.id)
+    os.makedirs(job_dir, exist_ok=True)
+
+    total = 0
+    try:
+        for index, (upload, title) in enumerate(zip(files, list(titles) + [""] * len(files)), start=1):
+            dest = os.path.join(job_dir, f"src-{index}.m4a")
+            size = 0
+            with open(dest, "wb") as out:
+                while True:
+                    chunk = upload.file.read(1 << 20)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    total += len(chunk)
+                    if size > MAX_FILE_MB * 1024 * 1024:
+                        raise HTTPException(413, f"الملف {index} أكبر من الحد المسموح")
+                    if total > MAX_JOB_MB * 1024 * 1024:
+                        raise HTTPException(413, "مجموع الملفات أكبر من حد المهمة")
+                    out.write(chunk)
+            if size == 0:
+                raise HTTPException(400, f"الملف {index} فارغ")
+            job.files.append(JobFile(
+                title=str(title or f"episode-{index}"),
+                url=None,
+                cookie=None,
+                referer=None,
+                bitrate=bitrate,
+                mono=mono,
+                src_path=dest,
+                bytes_in=size,
+            ))
+    except HTTPException:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise
+    finally:
+        for upload in files:
+            try:
+                upload.file.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    with LOCK:
+        JOBS[job.id] = job
+    QUEUE.put(job.id)
+    return {"job_id": job.id, "files": len(job.files), "bytes": total, "mode": "upload"}
 
 
 def _get_job(job_id: str, owner: str) -> Job:
