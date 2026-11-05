@@ -51,9 +51,9 @@ WORK_DIR = os.environ.get("WORK_DIR", "/tmp/nlm")
 TTL_MINUTES = int(os.environ.get("TTL_MINUTES", "45"))
 MP3_BITRATE = int(os.environ.get("MP3_BITRATE", "96000"))
 MP3_MONO = os.environ.get("MP3_MONO", "1") not in ("0", "false", "False", "")
-MAX_FILES = int(os.environ.get("MAX_FILES", "30"))
+MAX_FILES = int(os.environ.get("MAX_FILES", "20"))
 MAX_FILE_MB = int(os.environ.get("MAX_FILE_MB", "400"))
-MAX_JOB_MB = int(os.environ.get("MAX_JOB_MB", "800"))
+MAX_JOB_MB = int(os.environ.get("MAX_JOB_MB", "250"))
 DEBUG = os.environ.get("NLM_DEBUG", "0") == "1"
 
 
@@ -307,7 +307,7 @@ def healthz() -> dict:
     return {
         "ok": True,
         "service": "notebooklm-mp3",
-        "version": "0.5.0",
+        "version": "0.5.1",
         "python": sys.version.split()[0],
         "pyav": getattr(_av, "__version__", "?"),
         "jobs": len(JOBS),
@@ -408,7 +408,7 @@ def diagnose(req: DiagnoseRequest, owner: str = Depends(auth)) -> dict:
         "referer_sent": bool(req.referer),
         "server": {
             "service": "notebooklm-mp3",
-            "version": "0.5.0",
+            "version": "0.5.1",
             "python": sys.version.split()[0],
             "platform": platform.platform(),
             "pyav": getattr(_av, "__version__", "?"),
