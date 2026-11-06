@@ -31,11 +31,12 @@ import zipstream
 WORK_DIR = os.environ.get("WORK_DIR", "/tmp/nlm")
 COLS_DIR = os.path.join(WORK_DIR, "collections")
 TTL_MINUTES = int(os.environ.get("TTL_MINUTES", "45"))
-WORKERS = max(1, int(os.environ.get("COLLECTION_WORKERS", "2")))
+WORKERS = max(1, int(os.environ.get("COLLECTION_WORKERS", "1")))   # تسلسل كامل: يمنع OOM و403 المتزامن
 MAX_COLLECTION_MB = int(os.environ.get("MAX_COLLECTION_MB", "1500"))
 MAX_ITEMS = int(os.environ.get("MAX_COLLECTION_FILES", "400"))
 MATCH_DEFAULT = float(os.environ.get("ORDER_MATCH", "0.60"))     # 50%..80%
 MOVE_DELAY = float(os.environ.get("ORDER_MOVE_DELAY", "0.15"))   # 150ms
+RETRIES = max(1, int(os.environ.get("DOWNLOAD_RETRIES", "3")))
 SORTED = os.environ.get("SORTED_DIRNAME", "تم الترتيب")
 MP3_BITRATE = int(os.environ.get("MP3_BITRATE", "96000"))
 MP3_MONO = os.environ.get("MP3_MONO", "1") not in ("0", "false", "False", "")
@@ -104,6 +105,8 @@ class Item:
     score: float = 0.0
     elapsed_in: float = 0.0
     elapsed_conv: float = 0.0
+    attempts: int = 0
+    status: int = 0
 
 
 @dataclass
@@ -197,6 +200,7 @@ class Collection:
                 "idx": i.idx, "title": i.title, "state": i.state,
                 "bytes_out": i.bytes_out, "error": i.error[:200],
                 "final_name": i.final_name, "order": i.order, "score": round(i.score, 2),
+                "attempts": i.attempts, "status": i.status,
                 "sec_in": round(i.elapsed_in, 1), "sec_conv": round(i.elapsed_conv, 1),
             } for i in self.items]
             d["ordered"] = [{"order": e["order"], "name": e["name"], "size": e["size"]}
@@ -213,10 +217,41 @@ def _disk_free_mb() -> float:
         return 10_000.0
 
 
-def _process(col: Collection, it: Item) -> None:
+def _attempt(col: Collection, it: Item) -> None:
+    """محاولة واحدة: تنزيل + تحويل. ترفع MediaError عند الفشل."""
     os.makedirs(col.raw_dir, exist_ok=True)
     src = os.path.join(col.raw_dir, f"{it.idx:04d}.m4a")
     dst = os.path.join(col.raw_dir, f"{it.idx:04d}.mp3")
+    try:
+        it.state = "downloading"
+        t0 = time.time()
+        it.bytes_in = media.download(
+            it.url, src, cookie=it.cookie, cookie_map=it.cookie_map,
+            user_agent=it.user_agent, referer=it.referer,
+            max_bytes=400 * 1024 * 1024, timeout=180.0,
+        )
+        it.elapsed_in = time.time() - t0
+        if it.bytes_in < 1024:
+            raise media.MediaError(f"الملف صغير جدًا ({it.bytes_in} بايت) — الرابط ليس صوتًا")
+
+        it.state = "converting"
+        t1 = time.time()
+        info = media.m4a_to_mp3(src, dst, bitrate=it.bitrate, mono=it.mono)
+        it.elapsed_conv = time.time() - t1
+        it.bytes_out = int(info.get("bytes") or os.path.getsize(dst))
+        it.mp3 = dst
+        it.state = "done"
+        col.note(f"✅ {it.title} · {it.bytes_out/1048576:.1f} م.ب")
+    finally:
+        try:
+            if os.path.exists(src):
+                os.remove(src)
+        except OSError:
+            pass
+
+
+def _process(col: Collection, it: Item) -> None:
+    # فحوص المساحة مرة واحدة قبل المحاولات
     try:
         used_mb = sum(i.bytes_out for i in col.items) / (1024 * 1024)
         if used_mb >= MAX_COLLECTION_MB:
@@ -230,43 +265,32 @@ def _process(col: Collection, it: Item) -> None:
                 f"مساحة السيرفر على وشك الانتهاء (المتاح {free:.0f} م.ب). "
                 "أعد المحاولة بعد قليل أو احذف مجموعات قديمة."
             )
-
-        it.state = "downloading"
-        t0 = time.time()
-        try:
-            it.bytes_in = media.download(
-                it.url, src, cookie=it.cookie, cookie_map=it.cookie_map,
-                user_agent=it.user_agent, referer=it.referer,
-                max_bytes=400 * 1024 * 1024, timeout=180.0,
-            )
-        except media.MediaError as e:
-            raise e
-        except Exception as e:                      # noqa: BLE001
-            raise media.MediaError(f"فشل التنزيل: {type(e).__name__}: {e}") from e
-        it.elapsed_in = time.time() - t0
-
-        it.state = "converting"
-        t1 = time.time()
-        info = media.m4a_to_mp3(src, dst, bitrate=it.bitrate, mono=it.mono)
-        it.elapsed_conv = time.time() - t1
-        it.bytes_out = int(info.get("bytes") or os.path.getsize(dst))
-        it.mp3 = dst
-        it.state = "done"
-        col.note(f"✅ {it.title} · {it.bytes_out/1048576:.1f} م.ب")
     except media.MediaError as e:
         it.state = "error"
         it.error = str(e)
         col.note(f"❌ {it.title} · {str(e)[:120]}")
-    except Exception as e:                          # noqa: BLE001
-        it.state = "error"
-        it.error = f"{type(e).__name__}: {e}"
-        col.note(f"❌ {it.title} · {it.error[:120]}")
-    finally:
+        return
+
+    last = ""
+    for attempt in range(RETRIES):
+        it.attempts = attempt + 1
         try:
-            if os.path.exists(src):
-                os.remove(src)
-        except OSError:
-            pass
+            _attempt(col, it)
+            if it.attempts > 1:
+                col.note(f"✅ {it.title} نجحت في المحاولة {it.attempts}")
+            return
+        except media.MediaError as e:
+            last = str(e) or "فشل غير معروف"
+        except Exception as e:                      # noqa: BLE001
+            last = f"{type(e).__name__}: {e}"
+        it.state = "pending"
+        if attempt + 1 < RETRIES:
+            col.note(f"↻ {it.title} — محاولة {attempt + 2}/{RETRIES} بعد {last[:70]}")
+            time.sleep(1.5 * (attempt + 1))
+
+    it.state = "error"
+    it.error = last or "سبب غير معروف (لم يصل أي تفسير من الشبكة)"
+    col.note(f"❌ {it.title} · {it.error[:140]}")
 
 
 def _run(col: Collection) -> None:
@@ -274,11 +298,15 @@ def _run(col: Collection) -> None:
         if it.state != "pending":
             continue
         with _SEM:
-            if col.state in ("sorting", "done", "partial"):
-                return
             _process(col, it)
             col._refresh()
+    # أي عنصر لم يُعالج يُوسم صراحةً بسبب واضح (لا يبقى صامتًا أبدًا)
     with col._lock:
+        for it in col.items:
+            if it.state in ("pending", "downloading", "converting"):
+                it.state = "error"
+                it.error = it.error or "لم يكتمل التنزيل (توقف غير متوقع)"
+                col.note(f"⚠️ {it.title} · {it.error[:100]}")
         col.finished_at = time.time()
     col._refresh()
     if col.state == "waiting_order":

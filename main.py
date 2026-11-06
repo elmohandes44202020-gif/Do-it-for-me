@@ -326,7 +326,7 @@ def healthz() -> dict:
     return {
         "ok": True,
         "service": "notebooklm-mp3",
-        "version": "0.6.1",
+        "version": "0.6.2",
         "python": sys.version.split()[0],
         "pyav": getattr(_av, "__version__", "?"),
         "jobs": len(JOBS),
@@ -962,6 +962,28 @@ def retry_collection(col_id: str, owner: str = Depends(auth)) -> dict:
     col = _own_collection(col_id, owner)
     n = colls.retry(col)
     return {"retried": n, "state": col.state}
+
+
+@app.get("/collections/{col_id}/probe")
+def probe_collection_item(col_id: str, idx: int = 0, owner: str = Depends(auth)) -> dict:
+    """تشخيص حلقة واحدة: ماذا يرد جوجل بالضبط؟ (كود الحالة، الكوكيز، التحويلات)"""
+    col = _own_collection(col_id, owner)
+    if idx < 0 or idx >= len(col.items):
+        raise HTTPException(404, "رقم الحلقة غير موجود")
+    it = col.items[idx]
+    r = media.probe(
+        it.url, cookie=it.cookie, cookie_map=it.cookie_map,
+        user_agent=it.user_agent, referer=it.referer,
+    )
+    r.update({
+        "title": it.title,
+        "state": it.state,
+        "attempts": it.attempts,
+        "saved_error": it.error,
+        "has_cookie": bool(it.cookie or it.cookie_map),
+        "cookie_domains": sorted((it.cookie_map or {}).keys()),
+    })
+    return r
 
 
 @app.get("/collections/{col_id}/zip")
