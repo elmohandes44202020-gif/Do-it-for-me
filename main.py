@@ -326,7 +326,7 @@ def healthz() -> dict:
     return {
         "ok": True,
         "service": "notebooklm-mp3",
-        "version": "0.6.0",
+        "version": "0.6.1",
         "python": sys.version.split()[0],
         "pyav": getattr(_av, "__version__", "?"),
         "jobs": len(JOBS),
@@ -863,6 +863,7 @@ class CollectionItem(BaseModel):
     title: str
     url: str
     cookie: str | None = None
+    cookie_map: dict[str, str] | None = None
     user_agent: str | None = None
     referer: str | None = None
     bitrate: int | None = None

@@ -88,6 +88,7 @@ class Item:
     title: str
     url: str
     cookie: str | None = None
+    cookie_map: dict[str, str] | None = None
     user_agent: str | None = None
     referer: str | None = None
     bitrate: int = MP3_BITRATE
@@ -158,13 +159,11 @@ class Collection:
         if active:
             self.state = "running"
             return
-        if c["error"] == len(self.items):
+        if c["done"] == 0:
             self.state = "partial"
-        elif self.order_text.strip():
-            start_finalize(self)
             return
-        else:
-            self.state = "waiting_order"
+        # دائماً نُنهي بالترتيب: ملف الترتيب إن وُجد، وإلا ترتيب ظهور الحلقات.
+        start_finalize(self)
 
     def to_dict(self, base: str = "", detail: bool = False) -> dict[str, Any]:
         c = self.counts()
@@ -236,8 +235,9 @@ def _process(col: Collection, it: Item) -> None:
         t0 = time.time()
         try:
             it.bytes_in = media.download(
-                it.url, src, cookie=it.cookie, user_agent=it.user_agent,
-                referer=it.referer, max_bytes=400 * 1024 * 1024, timeout=180.0,
+                it.url, src, cookie=it.cookie, cookie_map=it.cookie_map,
+                user_agent=it.user_agent, referer=it.referer,
+                max_bytes=400 * 1024 * 1024, timeout=180.0,
             )
         except media.MediaError as e:
             raise e
@@ -387,7 +387,8 @@ def create(owner: str, name: str, items: Iterable[dict], order_text: str = "",
             idx=idx,
             title=str(raw.get("title") or f"حلقة {idx+1}"),
             url=str(raw.get("url") or ""),
-            cookie=raw.get("cookie"), user_agent=raw.get("user_agent"),
+            cookie=raw.get("cookie"), cookie_map=raw.get("cookie_map"),
+            user_agent=raw.get("user_agent"),
             referer=raw.get("referer"),
             bitrate=int(raw.get("bitrate") or MP3_BITRATE),
             mono=bool(raw.get("mono", MP3_MONO)),
