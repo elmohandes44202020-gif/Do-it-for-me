@@ -39,6 +39,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 import av as _av
+import notecol as colls
 import links
 import media
 import zipstream
@@ -325,7 +326,7 @@ def healthz() -> dict:
     return {
         "ok": True,
         "service": "notebooklm-mp3",
-        "version": "0.5.4",
+        "version": "0.6.0",
         "python": sys.version.split()[0],
         "pyav": getattr(_av, "__version__", "?"),
         "jobs": len(JOBS),
@@ -426,7 +427,7 @@ def diagnose(req: DiagnoseRequest, owner: str = Depends(auth)) -> dict:
         "referer_sent": bool(req.referer),
         "server": {
             "service": "notebooklm-mp3",
-            "version": "0.5.4",
+            "version": "0.6.0",
             "python": sys.version.split()[0],
             "platform": platform.platform(),
             "pyav": getattr(_av, "__version__", "?"),
@@ -850,6 +851,144 @@ def cd_header(filename: str) -> str:
     ascii_fallback = f"{ascii_stem}.{ascii_ext}" if ascii_ext else ascii_stem
     return (f'attachment; filename="{ascii_fallback}"; '
             f"filename*=UTF-8''{quote(filename)}")
+
+
+# ═══════════════════════ مجموعات: دفتر ملاحظات كامل ═══════════════════════
+# كل حلقات الدفتر (أي عدد) في طلب واحد → التنزيل والتحويل بالتسلسل →
+# الترتيب من ملف نصي مرجعي ونقل كل ملف إلى «تم الترتيب/» بفاصل 150ms →
+# ZIP واحد باسم دفتر الملاحظات. لا مجلد لكل دفعة: مجلد واحد للكل.
+
+
+class CollectionItem(BaseModel):
+    title: str
+    url: str
+    cookie: str | None = None
+    user_agent: str | None = None
+    referer: str | None = None
+    bitrate: int | None = None
+    mono: bool | None = None
+
+
+class CollectionRequest(BaseModel):
+    name: str = "notebooklm-audio"
+    order_text: str = ""
+    match: float | None = None
+    files: list[CollectionItem] = Field(default_factory=list)
+
+
+class OrderRequest(BaseModel):
+    text: str = ""
+    match: float | None = None
+
+
+def _own_collection(col_id: str, owner: str) -> "colls.Collection":
+    col = colls.get(col_id)
+    if not col or col.owner != owner:
+        raise HTTPException(404, "المجموعة غير موجودة")
+    return col
+
+
+@app.post("/collections", status_code=202)
+def create_collection(req: CollectionRequest, owner: str = Depends(auth)) -> dict:
+    if not req.files:
+        raise HTTPException(400, "لا حلقات في الطلب")
+    if len(req.files) > colls.MAX_ITEMS:
+        raise HTTPException(400, f"الحد الأقصى {colls.MAX_ITEMS} حلقة في المجموعة")
+    missing = [f.title for f in req.files if not (f.url or "").startswith(("http://", "https://"))]
+    if missing:
+        raise HTTPException(400, "روابط غير صالحة: " + "، ".join(missing[:5]))
+    col = colls.create(
+        owner, req.name, [f.model_dump() for f in req.files],
+        order_text=req.order_text, match=req.match,
+    )
+    return {
+        "collection_id": col.id,
+        "count": len(col.items),
+        "state": col.state,
+        "match": col.match,
+    }
+
+
+@app.get("/collections")
+def list_collections(owner: str = Depends(auth)) -> dict:
+    mine = [c for c in colls.COLS.values() if c.owner == owner]
+    mine.sort(key=lambda c: c.created_at, reverse=True)
+    return {
+        "count": len(mine),
+        "limits": {
+            "max_items": colls.MAX_ITEMS,
+            "max_collection_mb": colls.MAX_COLLECTION_MB,
+            "ttl_minutes": colls.TTL_MINUTES,
+            "move_delay_ms": int(colls.MOVE_DELAY * 1000),
+            "sorted_dirname": colls.SORTED,
+        },
+        "collections": [c.to_dict(detail=False) for c in mine],
+    }
+
+
+@app.get("/collections/{col_id}")
+def get_collection(col_id: str, owner: str = Depends(auth)) -> dict:
+    col = _own_collection(col_id, owner)
+    return col.to_dict(detail=True)
+
+
+@app.post("/collections/{col_id}/order")
+def set_order(col_id: str, req: OrderRequest, owner: str = Depends(auth)) -> dict:
+    col = _own_collection(col_id, owner)
+    col.order_text = req.text or ""
+    if req.match is not None:
+        col.match = min(0.80, max(0.50, float(req.match)))
+    col.note(f"📄 ملف ترتيب: {len(colls.order_lines(col.order_text))} سطر · "
+             f"مطابقة {int(col.match * 100)}%")
+    if col.counts()["pending"] == 0 and col.counts()["downloading"] == 0 \
+            and col.counts()["converting"] == 0:
+        colls.start_finalize(col)
+        col.finished_at = None
+    return col.to_dict()
+
+
+@app.post("/collections/{col_id}/finalize")
+def finalize_collection(col_id: str, owner: str = Depends(auth)) -> dict:
+    col = _own_collection(col_id, owner)
+    if col.state == "running":
+        raise HTTPException(409, "المجموعة لا تزال قيد التنزيل/التحويل")
+    colls.start_finalize(col)
+    return {"started": True, "state": col.state}
+
+
+@app.post("/collections/{col_id}/retry")
+def retry_collection(col_id: str, owner: str = Depends(auth)) -> dict:
+    col = _own_collection(col_id, owner)
+    n = colls.retry(col)
+    return {"retried": n, "state": col.state}
+
+
+@app.get("/collections/{col_id}/zip")
+def collection_zip(col_id: str, owner: str = Depends(auth)):
+    col = _own_collection(col_id, owner)
+    if col.state not in ("done", "partial"):
+        raise HTTPException(409, "المجموعة لم تنتهِ بعد")
+    entries, total = colls.zip_entries(col)
+    if not entries:
+        raise HTTPException(404, "لا ملفات في هذه المجموعة")
+    headers = {
+        "Content-Disposition": cd_header(f"{col.name}.zip"),
+        "Content-Length": str(total),
+        "X-Total-Bytes": str(total),
+        "X-Files": str(len(entries)),
+        "Cache-Control": "no-store",
+    }
+    return StreamingResponse(colls.zipstream.stream_zip(entries),
+                             media_type="application/zip", headers=headers)
+
+
+@app.delete("/collections/{col_id}")
+def delete_collection(col_id: str, owner: str = Depends(auth)) -> dict:
+    col = _own_collection(col_id, owner)
+    colls.delete(col.id)
+    return {"deleted": col.id}
+
+
 
 
 def _file_iter(path: str, chunk: int = 1 << 16):
