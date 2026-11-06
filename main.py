@@ -325,7 +325,7 @@ def healthz() -> dict:
     return {
         "ok": True,
         "service": "notebooklm-mp3",
-        "version": "0.5.3",
+        "version": "0.5.4",
         "python": sys.version.split()[0],
         "pyav": getattr(_av, "__version__", "?"),
         "jobs": len(JOBS),
@@ -426,7 +426,7 @@ def diagnose(req: DiagnoseRequest, owner: str = Depends(auth)) -> dict:
         "referer_sent": bool(req.referer),
         "server": {
             "service": "notebooklm-mp3",
-            "version": "0.5.3",
+            "version": "0.5.4",
             "python": sys.version.split()[0],
             "platform": platform.platform(),
             "pyav": getattr(_av, "__version__", "?"),
@@ -736,6 +736,44 @@ def _get_job(job_id: str, owner: str) -> Job:
     if not job or job.owner != owner:
         raise HTTPException(404, "المهمة غير موجودة أو انتهت صلاحيتها")
     return job
+
+
+@app.get("/jobs")
+def list_jobs(request: Request, owner: str = Depends(auth)) -> dict:
+    """لوحة إدارة: كل مهام هذا المستخدم وحالتها (بدون تحميل أي ملف)."""
+    base = str(request.base_url).rstrip("/")
+    with LOCK:
+        mine = [j for j in JOBS.values() if j.owner == owner]
+    mine.sort(key=lambda j: j.created_at, reverse=True)
+
+    rows = []
+    for j in mine:
+        done = sum(1 for f in j.files if f.state == "done")
+        failed = sum(1 for f in j.files if f.state == "error")
+        rows.append({
+            "job_id": j.id,
+            "state": j.state,
+            "name": (j.zip_name or "notebooklm-audio"),
+            "files_total": len(j.files),
+            "files_done": done,
+            "files_failed": failed,
+            "bytes_out": sum(f.bytes_out for f in j.files),
+            "created_at": int(j.created_at),
+            "expires_in_sec": (max(0, int(j.expires_at - time.time())) if j.expires_at else None),
+            "zip_url": f"{base}/jobs/{j.id}/zip" if j.state == "done" else None,
+            "error": j.error,
+            "titles": [f.title for f in j.files if f.state == "done"][:30],
+            "failures": [
+                {"title": f.title, "error": (f.error or "")[:300]}
+                for f in j.files if f.state == "error"
+            ][:30],
+        })
+    return {
+        "count": len(rows),
+        "queued": QUEUE.qsize(),
+        "limits": {"max_files": MAX_FILES, "max_job_mb": MAX_JOB_MB, "ttl_minutes": TTL_MINUTES},
+        "jobs": rows,
+    }
 
 
 @app.get("/jobs/{job_id}")
