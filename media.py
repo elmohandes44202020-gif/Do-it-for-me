@@ -340,3 +340,31 @@ def safe_name(title: str, index: int, fallback: str = "audio") -> str:
     if len(base) > 80:
         base = base[:80].rstrip()
     return base
+
+# ── أسماء الملفات: العنوان الأصلي كما هو ────────────────────────────────
+# لا نضيف أرقامًا ولا بادئات. التغيير الوحيد المسموح هو إزالة المحارف التي
+# تمنع الحفظ أصلًا على أندرويد/ويندوز ( / \ : * ? " < > | ) والمحارف الصفرية،
+# مع قصّ الأسماء الطويلة جدًا (حد نظام الملفات ~255 بايت).
+_ILLEGAL_EXACT = re.compile(r'[\\/:*?"<>|\x00-\x1f]+')
+
+
+def episode_filename(title: str, index: int, taken: set[str] | None = None) -> str:
+    """`الحلقة الأولى.mp3` — الاسم الأصلي بلا زيادة. عند تكرار الاسم نفسه
+    نضيف (2) و(3) فقط لأن ملفين بنفس الاسم لا يمكن أن يوجدا في مجلد واحد."""
+    base = _WS.sub(" ", (title or "").strip())
+    base = _ILLEGAL_EXACT.sub(" ", base)          # المحارف الممنوعة → مسافة
+    base = _WS.sub(" ", base).strip(" .")          # ثم نُنظّف المسافات
+    if not base:
+        base = f"حلقة {index}"
+    if len(base) > 120:
+        base = base[:120].rstrip()
+
+    name = f"{base}.mp3"
+    if taken is not None:
+        if name in taken:
+            stem, n = base, 2
+            while f"{stem} ({n}).mp3" in taken:
+                n += 1
+            name = f"{stem} ({n}).mp3"
+        taken.add(name)
+    return name

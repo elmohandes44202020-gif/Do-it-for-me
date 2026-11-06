@@ -208,42 +208,60 @@ def _work(job_id: str) -> None:
     job_dir = os.path.join(WORK_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
     budget = MAX_JOB_MB * 1024 * 1024
-    used = 0
+    used = 0   # بايتات ملفات MP3 المحفوظة (المصدر يُحذف بعد كل تحويل)
+
+    # أسماء الملفات = عناوين الحلقات الأصلية كما هي، بلا ترقيم ولا بادئات.
+    taken: set[str] = set()
+    for i, f in enumerate(job.files, start=1):
+        f.zip_name = media.episode_filename(f.title, i, taken)
 
     try:
         for index, f in enumerate(job.files, start=1):
             src = os.path.join(job_dir, f"src-{index}.m4a")
-            name = media.safe_name(f.title, index)
-            dst = os.path.join(job_dir, f"{index:02d}-{name}.mp3")
+            dst = os.path.join(job_dir, f"out-{index:02d}.mp3")
             try:
                 if f.src_path:
                     # الملف وصل جاهزًا من الهاتف — لا حاجة لأي تنزيل من جوجل
                     f.state = "converting"
                     f.bytes_in = os.path.getsize(f.src_path)
                 else:
+                    allowed = budget - used
+                    budget_limited = allowed < MAX_FILE_MB * 1024 * 1024
                     f.state = "downloading"
-                    used += media.download(
-                    f.url,
-                    src,
-                        cookie=f.cookie or job.shared_cookie,
+                    try:
+                        media.download(
+                            f.url,
+                            src,
+                            cookie=f.cookie or job.shared_cookie,
                         cookie_map=f.cookie_map,
                         user_agent=job.user_agent,
                         referer=f.referer,
-                        max_bytes=min(MAX_FILE_MB * 1024 * 1024, budget - used),
-                        on_bytes=lambda n, _f=f: setattr(_f, "bytes_in", n),
-                    )
+                            max_bytes=min(MAX_FILE_MB * 1024 * 1024, max(1, allowed)),
+                            on_bytes=lambda n, _f=f: setattr(_f, "bytes_in", n),
+                        )
+                    except media.MediaError as exc:
+                        if budget_limited and "تجاوز الحد" in str(exc):
+                            raise media.MediaError(
+                                "لا توجد مساحة كافية في هذه المهمة (المتبقي {} م.ب من {} م.ب). "
+                                "أرسل بقية الحلقات في دفعة جديدة.".format(
+                                    max(0, allowed) // (1024 * 1024), MAX_JOB_MB)) from None
+                        raise
                     f.state = "converting"
                 info = media.m4a_to_mp3(src, dst, bitrate=f.bitrate, mono=f.mono)
                 f.duration_sec = info["duration_sec"]
                 f.bytes_out = info["bytes"]
                 f.mp3_path = dst
-                f.zip_name = os.path.basename(dst)
                 f.crc, size = zipstream.crc_of(dst)
                 f.bytes_out = size
+                used += size          # ما يُحفظ فعلًا على القرص هو الناتج فقط
                 f.state = "done"
             except Exception as exc:  # noqa: BLE001
                 f.state = "error"
-                f.error = f"{type(exc).__name__}: {exc}" if DEBUG else str(exc)
+                msg = f"{type(exc).__name__}: {exc}" if DEBUG else str(exc)
+                if used >= budget * 0.95:
+                    msg += " — انتهت مساحة المهمة ({} م.ب). قلّل عدد الحلقات في الدفعة.".format(
+                        MAX_JOB_MB)
+                f.error = msg
                 if os.path.exists(dst):
                     os.remove(dst)
             finally:
@@ -307,7 +325,7 @@ def healthz() -> dict:
     return {
         "ok": True,
         "service": "notebooklm-mp3",
-        "version": "0.5.1",
+        "version": "0.5.3",
         "python": sys.version.split()[0],
         "pyav": getattr(_av, "__version__", "?"),
         "jobs": len(JOBS),
@@ -408,7 +426,7 @@ def diagnose(req: DiagnoseRequest, owner: str = Depends(auth)) -> dict:
         "referer_sent": bool(req.referer),
         "server": {
             "service": "notebooklm-mp3",
-            "version": "0.5.1",
+            "version": "0.5.3",
             "python": sys.version.split()[0],
             "platform": platform.platform(),
             "pyav": getattr(_av, "__version__", "?"),
@@ -775,12 +793,25 @@ def delete_job(job_id: str, owner: str = Depends(auth)) -> dict:
 
 
 def cd_header(filename: str) -> str:
-    """ترويسة تنزيل تدعم الأسماء العربية (RFC 5987) مع بديل ASCII."""
+    """ترويسة تنزيل تدعم الأسماء العربية (RFC 5987) مع بديل ASCII نظيف.
+
+    المتصفحات الحديثة تستخدم filename* (الاسم العربي كما هو)؛ والعملاء القديمة
+    تستخدم البديل ASCII، فنجعله بلا شرطات سفلية قدر الإمكان.
+    """
+    import re as _re
     from urllib.parse import quote
 
-    ascii_fallback = "".join(c if 32 <= ord(c) < 127 and c not in '"\\' else "_" for c in filename)
+    stem, _, ext = filename.rpartition(".")
+    if not stem:
+        stem, ext = filename, ""
+    ascii_stem = "".join(c for c in stem if 32 <= ord(c) < 127 and c not in '"\\')
+    ascii_stem = _re.sub(r"\s+", " ", ascii_stem).strip(" .-")
+    ascii_ext = "".join(c for c in ext if c.isalnum())[:5]
+    if not ascii_stem:
+        ascii_stem = "audio"
+    ascii_fallback = f"{ascii_stem}.{ascii_ext}" if ascii_ext else ascii_stem
     return (f'attachment; filename="{ascii_fallback}"; '
-            f"filename*=UTF-8''{quote(filename, safe='')}")
+            f"filename*=UTF-8''{quote(filename)}")
 
 
 def _file_iter(path: str, chunk: int = 1 << 16):
