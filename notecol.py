@@ -128,6 +128,14 @@ class Collection:
     unplaced_items: list[str] = field(default_factory=list)
     log: list[dict] = field(default_factory=list)
     last_tick: float = field(default_factory=time.time)
+    # رفع ميجا (اختياري)
+    mega_state: str = "idle"     # idle|uploading|link|done|error
+    mega_link: str = ""
+    mega_folder_link: str = ""
+    mega_error: str = ""
+    mega_percent: int = 0
+    mega_bytes: int = 0
+    mega_seconds: float = 0.0
     sort_seconds: float = 0.0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _zip: tuple[list[zipstream.Entry], int] | None = field(default=None, repr=False)
@@ -202,6 +210,15 @@ class Collection:
             "log": self.log[-40:],
             "failures": [{"title": i.title, "error": i.error[:300]}
                          for i in self.items if i.state == "error"][:60],
+            "mega": {
+                "state": self.mega_state,
+                "link": self.mega_link,
+                "folder_link": self.mega_folder_link,
+                "error": self.mega_error,
+                "percent": self.mega_percent,
+                "bytes": self.mega_bytes,
+                "seconds": self.mega_seconds,
+            },
         }
         if detail:
             d["items"] = [{

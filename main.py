@@ -39,6 +39,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 import av as _av
+import mega_up
 import notecol as colls
 import links
 import media
@@ -358,7 +359,7 @@ def _startup() -> None:
 
 @app.get("/diag")
 def diag(_owner: str = Depends(auth)) -> dict:
-    """حالة السيرفر الحقيقية: ذاكرة، قرص، خيوط، ونشاط كل مجموعة."""
+    """حالة السيرفر الحقيقية: ذاكرة، قرص، خيوط، ونشاط كل مجموعة، وحالة MEGA."""
     def _read(path: str) -> str | None:
         try:
             with open(path) as fh:
@@ -410,8 +411,9 @@ def diag(_owner: str = Depends(auth)) -> dict:
 
     return {
         "ok": True,
-        "version": "0.6.4",
+        "version": "0.7.1",
         "uptime_sec": round(now - STARTED_AT, 1),
+        "mega": mega_up.info(),
         "memory": {"rss_mb": rss_mb,
                    "cgroup_max_mb": _mb(cg_max) if cg_max not in (None, "max") else None,
                    "cgroup_used_mb": _mb(cg_cur)},
@@ -430,7 +432,7 @@ def healthz() -> dict:
     return {
         "ok": True,
         "service": "notebooklm-mp3",
-        "version": "0.6.4",
+        "version": "0.7.1",
         "python": sys.version.split()[0],
         "pyav": getattr(_av, "__version__", "?"),
         "jobs": len(JOBS),
@@ -531,7 +533,7 @@ def diagnose(req: DiagnoseRequest, owner: str = Depends(auth)) -> dict:
         "referer_sent": bool(req.referer),
         "server": {
             "service": "notebooklm-mp3",
-            "version": "0.6.4",
+            "version": "0.7.1",
             "python": sys.version.split()[0],
             "platform": platform.platform(),
             "pyav": getattr(_av, "__version__", "?"),
@@ -846,7 +848,7 @@ def _get_job(job_id: str, owner: str) -> Job:
 @app.get("/jobs")
 def list_jobs(request: Request, owner: str = Depends(auth)) -> dict:
     """لوحة إدارة: كل مهام هذا المستخدم وحالتها (بدون تحميل أي ملف)."""
-    base = str(request.base_url).rstrip("/")
+    base = _public_base(request)
     with LOCK:
         mine = [j for j in JOBS.values() if j.owner == owner]
     mine.sort(key=lambda j: j.created_at, reverse=True)
@@ -1001,6 +1003,13 @@ def _own_collection(col_id: str, owner: str) -> "colls.Collection":
 
 
 
+def _public_base(request: Request) -> str:
+    """أصل الرابط كما يراه المستخدم (https دائمًا خلف الوكيل)."""
+    host = request.headers.get("host") or request.url.netloc
+    proto = (request.headers.get("x-forwarded-proto") or "https").split(",")[0].strip()
+    return f"{proto}://{host}"
+
+
 def _signed(d: dict, base: str) -> dict:
     if d.get("zip_url") and base:
         d["zip_url_signed"] = f"{base}/collections/{d['id']}/zip?t={sign_link('c', d['id'])}"
@@ -1031,7 +1040,7 @@ def create_collection(req: CollectionRequest, owner: str = Depends(auth)) -> dic
 
 @app.get("/collections")
 def list_collections(request: Request, owner: str = Depends(auth)) -> dict:
-    base = str(request.base_url).rstrip("/")
+    base = _public_base(request)
     mine = [c for c in colls.COLS.values() if c.owner == owner]
     mine.sort(key=lambda c: c.created_at, reverse=True)
     return {
@@ -1050,8 +1059,158 @@ def list_collections(request: Request, owner: str = Depends(auth)) -> dict:
 @app.get("/collections/{col_id}")
 def get_collection(col_id: str, request: Request, owner: str = Depends(auth)) -> dict:
     col = _own_collection(col_id, owner)
-    base = str(request.base_url).rstrip("/")
+    base = _public_base(request)
     return _signed(col.to_dict(base=base, detail=True), base)
+
+
+class MegaSessionReq(BaseModel):
+    sealed: str = Field(min_length=0, default="")
+
+
+class MegaUploadReq(BaseModel):
+    session_id: str = ""
+    wipe_after: bool = True
+
+
+@app.get("/mega/key")
+def mega_public_key(owner: str = Depends(auth)) -> dict:
+    """المفتاح العام المؤقت (يُعاد توليده مع كل تشغيل ولا يُخزَّن)."""
+    if not mega_up.rsa_available():
+        raise HTTPException(status_code=503, detail="وحدة التشفير غير متاحة على السيرفر")
+    return {"alg": "RSA-OAEP-SHA1", "pubkey": mega_up.public_pem(),
+            "env_creds": mega_up.enabled()}
+
+
+@app.post("/mega/session")
+def mega_open_session(req: MegaSessionReq, owner: str = Depends(auth)) -> dict:
+    """يفك ظرف الهاتف، يسجّل الدخول لميجا، ثم يمسح النص الصريح ويحتفظ بالجلسة فقط."""
+    if not req.sealed:
+        raise HTTPException(status_code=400, detail="لا يوجد ظرف مشفّر")
+    if not mega_up.rsa_available():
+        raise HTTPException(status_code=503, detail="وحدة التشفير غير متاحة على السيرفر")
+    try:
+        email, password = mega_up.open_sealed(req.sealed)
+    except Exception as e:                    # noqa: BLE001
+        raise HTTPException(status_code=400,
+                            detail="تعذّر فك التشفير: " + type(e).__name__)
+    if not email or not password:
+        raise HTTPException(status_code=400, detail="البريد أو كلمة المرور ناقص")
+    try:
+        sid = mega_up.create_session(email, password)
+    except Exception as e:                    # noqa: BLE001
+        msg = f"{type(e).__name__}: {e}"
+        low = msg.lower()
+        if ("jsondecode" in low or "connection" in low or "timeout" in low
+                or "timed out" in low or "getaddrinfo" in low):
+            msg = "تعذّر الوصول إلى ميجا من السيرفر (شبكة/حجب) — جرّب لاحقًا"
+        elif "password" in low or "credential" in low or "login" in low or "auth" in low:
+            msg = "بيانات دخول ميجا غير صحيحة"
+        del password
+        raise HTTPException(status_code=401, detail=msg[:200])
+    del password                              # لا نُبقي كلمة المرور في أي مرجع
+    return {"session_id": sid, "email": mega_up.mask(email),
+            "expires_in_sec": mega_up.SESS_TTL,
+            "note": "البيانات لم تُخزَّن على السيرفر — الجلسة فقط"}
+
+
+@app.delete("/mega/session/{sid}")
+def mega_close_session(sid: str, owner: str = Depends(auth)) -> dict:
+    return {"closed": mega_up.drop_session(sid)}
+
+
+@app.post("/collections/{col_id}/mega", status_code=202)
+def mega_upload_collection(col_id: str, owner: str = Depends(auth),
+                           req: MegaUploadReq | None = None) -> dict:
+    """رفع ZIP المجموعة إلى حساب MEGA (يبدأ بعد تأكيد المستخدم في التطبيق)."""
+    col = _own_collection(col_id, owner)
+    sid = (req.session_id if req else "") or ""
+    sess = mega_up.session(sid) if sid else None
+    if sess is None and not mega_up.enabled():
+        raise HTTPException(status_code=400, detail=(
+            "لا توجد بيانات ميجا: افتح رفع mيجا من التطبيق وأدخل بريدك مرة واحدة "
+            "(تُرسَل مشفّرة ولا تُخزَّن)، أو اضبط MEGA_EMAIL/MEGA_PASSWORD."))
+    if col.state not in ("done", "partial") or not col.order:
+        raise HTTPException(status_code=409, detail="المجموعة لم تنتهِ بعد")
+    if col.mega_state in ("uploading", "link", "done"):
+        return {"state": col.mega_state, "link": col.mega_link,
+                "error": col.mega_error}
+    total = sum(int(e.get("size") or 0) for e in col.order) or 1
+    free = colls._disk_free_mb()
+    if free < (total / 1048576.0) * 1.25 + 40:
+        raise HTTPException(status_code=507, detail=(
+            f"مساحة القرص لا تكفي لبناء نسخة الرفع ({free:.0f}MB متاح). "
+            "نزّل الـZIP مباشرة بدل الرفع."))
+
+    zip_path = os.path.join(col.dir, "_mega_upload.zip")
+    remote = (col.name or "notebooklm-audio") + ".zip"
+    col.mega_state = "uploading"
+    col.mega_percent = 0
+    col.mega_error = ""
+    col.mega_link = ""
+    col.note("☁️ بدء الرفع إلى MEGA…")
+
+    def on_state(**kw: Any) -> None:
+        st = kw.get("state")
+        if st:
+            col.mega_state = st
+        if kw.get("percent") is not None:
+            col.mega_percent = int(kw.get("percent") or 0)
+        if kw.get("link"):
+            col.mega_link = str(kw["link"])
+        if kw.get("folder_link"):
+            col.mega_folder_link = str(kw["folder_link"])
+        if kw.get("error"):
+            col.mega_error = str(kw["error"])
+        if kw.get("seconds"):
+            col.mega_seconds = float(kw["seconds"])
+        if st == "done":
+            col.mega_percent = 100
+            col.note("☁️ تم الرفع إلى MEGA بنجاح")
+        elif st == "error":
+            col.note("❌ فشل الرفع إلى MEGA: " + col.mega_error[:120])
+        if st in ("done", "error"):
+            try:
+                if os.path.exists(zip_path):
+                    os.remove(zip_path)
+            except Exception:
+                pass
+
+    def worker() -> None:
+        try:
+            files, size = mega_up.build_zip(zip_path, col.order)
+            col.mega_bytes = size
+            if files == 0:
+                raise RuntimeError("لا ملفات لبنائها في ZIP الرفع")
+            col.note(f"☁️ نسخة الرفع جاهزة ({size/1048576:.1f} م.ب) — جارٍ التشفير والرفع")
+            if sess is not None:
+                mega_up.upload_with(sess["client"], zip_path, remote, on_state)
+                sess["uploads"] = int(sess.get("uploads", 0)) + 1
+                if (req.wipe_after if req else True) and sess.get("uploads", 0) >= 1:
+                    mega_up.drop_session(sid)          # مسح الجلسة بعد الاستخدام
+                    col.note("🔒 مُسحت بيانات الجلسة من ذاكرة السيرفر")
+            else:
+                mega_up.upload(zip_path, remote, on_state)
+        except Exception as e:                    # noqa: BLE001
+            col.mega_state = "error"
+            col.mega_error = f"{type(e).__name__}: {e}"[:300]
+            col.note("❌ فشل الرفع إلى MEGA: " + col.mega_error[:120])
+            try:
+                if os.path.exists(zip_path):
+                    os.remove(zip_path)
+            except Exception:
+                pass
+
+    threading.Thread(target=worker, name="mega-prep", daemon=True).start()
+    return {"state": "uploading", "link": "", "error": ""}
+
+
+@app.get("/collections/{col_id}/mega")
+def mega_state(col_id: str, owner: str = Depends(auth)) -> dict:
+    col = _own_collection(col_id, owner)
+    return {"enabled": mega_up.enabled(), "state": col.mega_state,
+            "link": col.mega_link, "folder_link": col.mega_folder_link,
+            "error": col.mega_error, "percent": col.mega_percent,
+            "bytes": col.mega_bytes, "seconds": col.mega_seconds}
 
 
 @app.post("/collections/{col_id}/order")
