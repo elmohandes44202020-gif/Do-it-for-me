@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import os
+import sys
 import threading
 import time
 import zipfile
@@ -27,6 +28,71 @@ _CLIENT_AT = 0.0
 SESSION_TTL = 25 * 60          # جلسة ميجا ~25 دقيقة ثم نعيد الدخول
 
 
+
+
+# ─────────────────── تحميل مكتبة ميجا عند الطلب ───────────────────
+# لا نضع mega.py في requirements.txt إطلاقًا: لو فشل تثبيتها لا يجب أن يفشل
+# النشر كله. نُثبّتها وقت أول استخدام داخل مجلد قابل للكتابة، وإن فشلت
+# تبقى بقية خدمات السيرفر (تنزيل + تحويل + ترتيب + ZIP) تعمل طبيعيًا.
+
+_LIB_DIR = os.environ.get("MEGA_LIB_DIR") or os.path.join(
+    os.environ.get("WORK_DIR", "/tmp/nlm"), "megalib")
+_lib_state = {"tried": False, "ok": False, "error": ""}
+
+
+def _shims() -> None:
+    """mega.py 1.0.8 كُتب لبايثون ≤3.9: يحتاج ترميمًا بسيطًا على 3.10+."""
+    import asyncio
+    import collections
+    import collections.abc
+    import types
+    for name in ("Sequence", "Mapping", "MutableMapping", "Iterable", "Callable",
+                 "Set", "MutableSet", "Hashable", "KeysView", "ItemsView", "ValuesView"):
+        if not hasattr(collections, name):
+            setattr(collections, name, getattr(collections.abc, name))
+    if not hasattr(asyncio, "coroutine"):
+        asyncio.coroutine = types.coroutine        # tenacity 5.x يستخدمها
+
+
+def _import_mega() -> Any:
+    _shims()
+    try:
+        from mega import Mega          # noqa: F401
+        _lib_state.update(tried=True, ok=True, error="")
+        return Mega
+    except Exception:
+        pass
+    if not _lib_state["tried"]:
+        _lib_state["tried"] = True
+        try:
+            import subprocess
+            os.makedirs(_LIB_DIR, exist_ok=True)
+            proc = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--no-input", "--quiet",
+                 "--target", _LIB_DIR, "mega.py==1.0.8"],
+                capture_output=True, text=True, timeout=300)
+            if proc.returncode != 0:
+                _lib_state["error"] = (proc.stderr or proc.stdout or "")[-300:].strip()
+        except Exception as e:               # noqa: BLE001
+            _lib_state["error"] = f"{type(e).__name__}: {e}"[:300]
+    if _LIB_DIR not in sys.path:
+        sys.path.insert(0, _LIB_DIR)
+    try:
+        from mega import Mega
+        _lib_state.update(ok=True, error="")
+        return Mega
+    except Exception as e:                   # noqa: BLE001
+        _lib_state["ok"] = False
+        if not _lib_state["error"]:
+            _lib_state["error"] = f"{type(e).__name__}: {e}"[:300]
+        raise RuntimeError("مكتبة ميجا غير متاحة: " + _lib_state["error"])
+
+
+def lib_info() -> dict:
+    return {"dir": _LIB_DIR, "ok": _lib_state["ok"],
+            "tried": _lib_state["tried"], "error": _lib_state["error"]}
+
+
 def enabled() -> bool:
     return bool(EMAIL and PASSWORD)
 
@@ -39,12 +105,15 @@ def info() -> dict:
         "email_set": bool(EMAIL),
         "folder": FOLDER,
         "library": _library_ok(),
+        "lib": lib_info(),
     }
 
 
 def _library_ok() -> bool:
+    if _lib_state["ok"]:
+        return True
     try:
-        import mega  # noqa: F401
+        _import_mega()
         return True
     except Exception:
         return False
@@ -198,7 +267,7 @@ def mask(email: str) -> str:
 
 
 def create_session(email: str, password: str) -> str:
-    from mega import Mega
+    Mega = _import_mega()
     m = Mega().login(email, password)          # ميجا تُشفّر بيانات الدخول داخليًا
     sid = base64.urlsafe_b64encode(os.urandom(18)).decode().rstrip("=")
     SESSIONS[sid] = {"client": m, "at": time.time(),

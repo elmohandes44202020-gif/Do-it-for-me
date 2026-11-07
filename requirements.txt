@@ -4,5 +4,4 @@ httpx
 av
 pydantic>=2
 python-multipart
-mega.py==1.0.8
-tenacity==8.2.3
+pycryptodome>=3.19

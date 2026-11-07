@@ -1,0 +1,9 @@
+# نسخة احتياطية: السيرفر يبنى ويعمل حتى لو أي حزمة اختيارية سببت مشكلة.
+# استخدمها بإعادة تسميتها إلى requirements.txt ثم أعد النشر.
+# (ميزة MEGA تحتاج mega.py — تُثبَّت تلقائيًا عند أول استخدام، وليست هنا)
+fastapi
+uvicorn[standard]
+httpx
+av
+pydantic>=2
+python-multipart
