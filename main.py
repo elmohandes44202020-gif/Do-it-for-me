@@ -49,7 +49,7 @@ app = FastAPI(title="NotebookLM → MP3", version="0.1.0")
 
 # ─────────────────────────────── الإعدادات ───────────────────────────────
 WORK_DIR = os.environ.get("WORK_DIR", "/tmp/nlm")
-TTL_MINUTES = int(os.environ.get("TTL_MINUTES", "45"))
+TTL_MINUTES = int(os.environ.get("TTL_MINUTES", "240"))
 MP3_BITRATE = int(os.environ.get("MP3_BITRATE", "96000"))
 MP3_MONO = os.environ.get("MP3_MONO", "1") not in ("0", "false", "False", "")
 MAX_FILES = int(os.environ.get("MAX_FILES", "20"))
@@ -58,7 +58,7 @@ MAX_JOB_MB = int(os.environ.get("MAX_JOB_MB", "250"))
 DEBUG = os.environ.get("NLM_DEBUG", "0") == "1"
 
 
-LINK_TTL_SEC = int(os.environ.get("LINK_TTL_MINUTES", "60")) * 60
+LINK_TTL_SEC = int(os.environ.get("LINK_TTL_MINUTES", "240")) * 60
 
 
 def _link_secret() -> str:
@@ -410,7 +410,7 @@ def diag(_owner: str = Depends(auth)) -> dict:
 
     return {
         "ok": True,
-        "version": "0.6.3",
+        "version": "0.6.4",
         "uptime_sec": round(now - STARTED_AT, 1),
         "memory": {"rss_mb": rss_mb,
                    "cgroup_max_mb": _mb(cg_max) if cg_max not in (None, "max") else None,
@@ -430,7 +430,7 @@ def healthz() -> dict:
     return {
         "ok": True,
         "service": "notebooklm-mp3",
-        "version": "0.6.3",
+        "version": "0.6.4",
         "python": sys.version.split()[0],
         "pyav": getattr(_av, "__version__", "?"),
         "jobs": len(JOBS),
@@ -531,7 +531,7 @@ def diagnose(req: DiagnoseRequest, owner: str = Depends(auth)) -> dict:
         "referer_sent": bool(req.referer),
         "server": {
             "service": "notebooklm-mp3",
-            "version": "0.6.0",
+            "version": "0.6.4",
             "python": sys.version.split()[0],
             "platform": platform.platform(),
             "pyav": getattr(_av, "__version__", "?"),

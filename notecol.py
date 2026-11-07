@@ -30,14 +30,14 @@ import zipstream
 # ─────────────────────────────── الإعدادات ───────────────────────────────
 WORK_DIR = os.environ.get("WORK_DIR", "/tmp/nlm")
 COLS_DIR = os.path.join(WORK_DIR, "collections")
-TTL_MINUTES = int(os.environ.get("TTL_MINUTES", "45"))
+TTL_MINUTES = int(os.environ.get("TTL_MINUTES", "240"))
 WORKERS = max(1, int(os.environ.get("COLLECTION_WORKERS", "1")))   # تسلسل كامل: يمنع OOM و403 المتزامن
-MAX_COLLECTION_MB = int(os.environ.get("MAX_COLLECTION_MB", "1500"))
+MAX_COLLECTION_MB = int(os.environ.get("MAX_COLLECTION_MB", "1200"))
 MAX_ITEMS = int(os.environ.get("MAX_COLLECTION_FILES", "400"))
 MATCH_DEFAULT = float(os.environ.get("ORDER_MATCH", "0.60"))     # 50%..80%
 MOVE_DELAY = float(os.environ.get("ORDER_MOVE_DELAY", "0.15"))   # 150ms
 RETRIES = max(1, int(os.environ.get("DOWNLOAD_RETRIES", "2")))
-DOWNLOAD_TIMEOUT = float(os.environ.get("DOWNLOAD_TIMEOUT_SEC", "60"))
+DOWNLOAD_TIMEOUT = float(os.environ.get("DOWNLOAD_TIMEOUT_SEC", "300"))
 FAIL_FAST_AFTER = int(os.environ.get("FAIL_FAST_AFTER", "3"))
 SORTED = os.environ.get("SORTED_DIRNAME", "تم الترتيب")
 MP3_BITRATE = int(os.environ.get("MP3_BITRATE", "96000"))
