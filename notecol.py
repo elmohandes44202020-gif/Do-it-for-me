@@ -36,7 +36,9 @@ MAX_COLLECTION_MB = int(os.environ.get("MAX_COLLECTION_MB", "1500"))
 MAX_ITEMS = int(os.environ.get("MAX_COLLECTION_FILES", "400"))
 MATCH_DEFAULT = float(os.environ.get("ORDER_MATCH", "0.60"))     # 50%..80%
 MOVE_DELAY = float(os.environ.get("ORDER_MOVE_DELAY", "0.15"))   # 150ms
-RETRIES = max(1, int(os.environ.get("DOWNLOAD_RETRIES", "3")))
+RETRIES = max(1, int(os.environ.get("DOWNLOAD_RETRIES", "2")))
+DOWNLOAD_TIMEOUT = float(os.environ.get("DOWNLOAD_TIMEOUT_SEC", "60"))
+FAIL_FAST_AFTER = int(os.environ.get("FAIL_FAST_AFTER", "3"))
 SORTED = os.environ.get("SORTED_DIRNAME", "تم الترتيب")
 MP3_BITRATE = int(os.environ.get("MP3_BITRATE", "96000"))
 MP3_MONO = os.environ.get("MP3_MONO", "1") not in ("0", "false", "False", "")
@@ -125,6 +127,7 @@ class Collection:
     unmatched_lines: list[str] = field(default_factory=list)
     unplaced_items: list[str] = field(default_factory=list)
     log: list[dict] = field(default_factory=list)
+    last_tick: float = field(default_factory=time.time)
     sort_seconds: float = 0.0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _zip: tuple[list[zipstream.Entry], int] | None = field(default=None, repr=False)
@@ -143,6 +146,11 @@ class Collection:
         return os.path.join(self.dir, media.safe_name(self.name, 0, "notebook"), SORTED)
 
     def note(self, msg: str) -> None:
+        self.last_tick = time.time()
+        try:
+            print(f"[col {self.id}] {msg}", flush=True)
+        except Exception:
+            pass
         with self._lock:
             self.log.append({"t": int(time.time()), "msg": msg[:300]})
             del self.log[:-200]
@@ -217,6 +225,22 @@ def _disk_free_mb() -> float:
         return 10_000.0
 
 
+
+def _maybe_fail_fast(col: Collection, last: str) -> None:
+    """لو أول حلقات كلها 401/403 ⇒ الروابط منتهية: أوقف بدل الانتظار ساعات."""
+    if "403" not in last and "401" not in last:
+        return
+    done = sum(1 for i in col.items if i.state == "done")
+    if done:
+        return
+    auth_fails = sum(1 for i in col.items
+                     if i.state == "error" and ("403" in (i.error or "") or "401" in (i.error or "")))
+    if auth_fails + 1 >= FAIL_FAST_AFTER:
+        if col.state != "partial":
+            col.error = ("الروابط أو الكوكيز انتهت صلاحيتها (401/403 متكرر). "
+                         "أعد الالتقاط من الاستديو وأرسل فورًا.")
+            col.note("⛔ إيقاف سريع: " + col.error)
+
 def _attempt(col: Collection, it: Item) -> None:
     """محاولة واحدة: تنزيل + تحويل. ترفع MediaError عند الفشل."""
     os.makedirs(col.raw_dir, exist_ok=True)
@@ -224,17 +248,19 @@ def _attempt(col: Collection, it: Item) -> None:
     dst = os.path.join(col.raw_dir, f"{it.idx:04d}.mp3")
     try:
         it.state = "downloading"
+        col.last_tick = time.time()
         t0 = time.time()
         it.bytes_in = media.download(
             it.url, src, cookie=it.cookie, cookie_map=it.cookie_map,
             user_agent=it.user_agent, referer=it.referer,
-            max_bytes=400 * 1024 * 1024, timeout=180.0,
+            max_bytes=400 * 1024 * 1024, timeout=DOWNLOAD_TIMEOUT,
         )
         it.elapsed_in = time.time() - t0
         if it.bytes_in < 1024:
             raise media.MediaError(f"الملف صغير جدًا ({it.bytes_in} بايت) — الرابط ليس صوتًا")
 
         it.state = "converting"
+        col.last_tick = time.time()
         t1 = time.time()
         info = media.m4a_to_mp3(src, dst, bitrate=it.bitrate, mono=it.mono)
         it.elapsed_conv = time.time() - t1
@@ -284,6 +310,7 @@ def _process(col: Collection, it: Item) -> None:
         except Exception as e:                      # noqa: BLE001
             last = f"{type(e).__name__}: {e}"
         it.state = "pending"
+        _maybe_fail_fast(col, last)
         if attempt + 1 < RETRIES:
             col.note(f"↻ {it.title} — محاولة {attempt + 2}/{RETRIES} بعد {last[:70]}")
             time.sleep(1.5 * (attempt + 1))

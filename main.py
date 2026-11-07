@@ -58,6 +58,40 @@ MAX_JOB_MB = int(os.environ.get("MAX_JOB_MB", "250"))
 DEBUG = os.environ.get("NLM_DEBUG", "0") == "1"
 
 
+LINK_TTL_SEC = int(os.environ.get("LINK_TTL_MINUTES", "60")) * 60
+
+
+def _link_secret() -> str:
+    env = os.environ.get("LINK_SECRET")
+    if env:
+        return env
+    keys = _load_keys()
+    return (next(iter(keys.values()), "") or "dev-secret") + "|links"
+
+
+def sign_link(kind: str, ident: str, ttl: int = LINK_TTL_SEC) -> str:
+    """توقيع مؤقت يسمح بتحميل الملف من المتصفح بدون ترويسة المفتاح."""
+    exp = int(time.time()) + ttl
+    mac = hmac.new(_link_secret().encode(), f"{kind}:{ident}:{exp}".encode(),
+                   hashlib.sha256).hexdigest()[:40]
+    return f"{exp}.{mac}"
+
+
+def check_link(kind: str, ident: str, token: str | None) -> bool:
+    if not token:
+        return False
+    try:
+        exp_s, mac = token.split(".", 1)
+        exp = int(exp_s)
+    except Exception:
+        return False
+    if time.time() > exp:
+        return False
+    good = hmac.new(_link_secret().encode(), f"{kind}:{ident}:{exp}".encode(),
+                    hashlib.sha256).hexdigest()[:40]
+    return hmac.compare_digest(good, mac)
+
+
 def _load_keys() -> dict[str, str]:
     """API_KEYS="ahmed:K1,sara:K2"  →  {hash(K1): "ahmed", ...}"""
     raw = os.environ.get("API_KEYS") or os.environ.get("API_KEY") or ""
@@ -197,6 +231,7 @@ class Job:
         }
 
 
+STARTED_AT = time.time()
 JOBS: dict[str, Job] = {}
 LOCK = threading.Lock()
 QUEUE: "queue.Queue[str]" = queue.Queue()
@@ -321,12 +356,81 @@ def _startup() -> None:
 
 
 
+@app.get("/diag")
+def diag(_owner: str = Depends(auth)) -> dict:
+    """حالة السيرفر الحقيقية: ذاكرة، قرص، خيوط، ونشاط كل مجموعة."""
+    def _read(path: str) -> str | None:
+        try:
+            with open(path) as fh:
+                return fh.read().strip()
+        except Exception:
+            return None
+
+    rss_mb = None
+    status = _read("/proc/self/status") or ""
+    for line in status.splitlines():
+        if line.startswith("VmRSS:"):
+            try:
+                rss_mb = round(int(line.split()[1]) / 1024, 1)
+            except Exception:
+                rss_mb = None
+            break
+    cg_max, cg_cur = _read("/sys/fs/cgroup/memory.max"), _read("/sys/fs/cgroup/memory.current")
+
+    def _mb(v):
+        try:
+            return round(int(v) / (1024 * 1024), 1)
+        except Exception:
+            return None
+
+    try:
+        du = shutil.disk_usage(WORK_DIR)
+        disk = {"free_mb": round(du.free / 1048576, 1),
+                "total_mb": round(du.total / 1048576, 1),
+                "used_mb": round(du.used / 1048576, 1)}
+    except Exception:
+        disk = {}
+
+    now = time.time()
+    cols = []
+    for c in colls.COLS.values():
+        cur = next((i for i in c.items
+                    if i.state in ("downloading", "converting")), None)
+        cols.append({
+            "id": c.id, "name": c.name, "state": c.state,
+            "done": c.counts()["done"], "failed": c.counts()["error"],
+            "pending": c.counts()["pending"],
+            "current": None if cur is None else {
+                "title": cur.title, "state": cur.state,
+                "attempts": cur.attempts, "bytes_in": cur.bytes_in,
+                "since_sec": round(now - c.last_tick, 1),
+            },
+            "idle_sec": round(now - c.last_tick, 1),
+        })
+
+    return {
+        "ok": True,
+        "version": "0.6.3",
+        "uptime_sec": round(now - STARTED_AT, 1),
+        "memory": {"rss_mb": rss_mb,
+                   "cgroup_max_mb": _mb(cg_max) if cg_max not in (None, "max") else None,
+                   "cgroup_used_mb": _mb(cg_cur)},
+        "disk": disk,
+        "threads": threading.active_count(),
+        "workers": colls.WORKERS,
+        "retries": colls.RETRIES,
+        "collections": cols,
+        "jobs": len(JOBS),
+        "max_collection_mb": colls.MAX_COLLECTION_MB,
+    }
+
+
 @app.get("/healthz")
 def healthz() -> dict:
     return {
         "ok": True,
         "service": "notebooklm-mp3",
-        "version": "0.6.2",
+        "version": "0.6.3",
         "python": sys.version.split()[0],
         "pyav": getattr(_av, "__version__", "?"),
         "jobs": len(JOBS),
@@ -798,8 +902,15 @@ def job_file(job_id: str, index: int, owner: str = Depends(auth)):
 
 
 @app.get("/jobs/{job_id}/zip")
-def job_zip(job_id: str, owner: str = Depends(auth)):
-    job = _get_job(job_id, owner)
+def job_zip(job_id: str, t: str | None = None,
+            x_api_key: str | None = Header(default=None)):
+    if t and check_link("j", job_id, t):
+        with LOCK:
+            job = JOBS.get(job_id)
+        if not job:
+            raise HTTPException(404, "المهمة غير موجودة")
+    else:
+        job = _get_job(job_id, auth(x_api_key))
     if job.state not in ("done", "error"):
         raise HTTPException(409, "المهمة لم تنتهِ بعد")
     done = [f for f in job.files if f.state == "done" and f.mp3_path]
@@ -889,6 +1000,14 @@ def _own_collection(col_id: str, owner: str) -> "colls.Collection":
     return col
 
 
+
+def _signed(d: dict, base: str) -> dict:
+    if d.get("zip_url") and base:
+        d["zip_url_signed"] = f"{base}/collections/{d['id']}/zip?t={sign_link('c', d['id'])}"
+        d["link_expires_in_sec"] = LINK_TTL_SEC
+    return d
+
+
 @app.post("/collections", status_code=202)
 def create_collection(req: CollectionRequest, owner: str = Depends(auth)) -> dict:
     if not req.files:
@@ -911,7 +1030,8 @@ def create_collection(req: CollectionRequest, owner: str = Depends(auth)) -> dic
 
 
 @app.get("/collections")
-def list_collections(owner: str = Depends(auth)) -> dict:
+def list_collections(request: Request, owner: str = Depends(auth)) -> dict:
+    base = str(request.base_url).rstrip("/")
     mine = [c for c in colls.COLS.values() if c.owner == owner]
     mine.sort(key=lambda c: c.created_at, reverse=True)
     return {
@@ -923,14 +1043,15 @@ def list_collections(owner: str = Depends(auth)) -> dict:
             "move_delay_ms": int(colls.MOVE_DELAY * 1000),
             "sorted_dirname": colls.SORTED,
         },
-        "collections": [c.to_dict(detail=False) for c in mine],
+        "collections": [_signed(c.to_dict(base=base, detail=False), base) for c in mine],
     }
 
 
 @app.get("/collections/{col_id}")
-def get_collection(col_id: str, owner: str = Depends(auth)) -> dict:
+def get_collection(col_id: str, request: Request, owner: str = Depends(auth)) -> dict:
     col = _own_collection(col_id, owner)
-    return col.to_dict(detail=True)
+    base = str(request.base_url).rstrip("/")
+    return _signed(col.to_dict(base=base, detail=True), base)
 
 
 @app.post("/collections/{col_id}/order")
@@ -987,8 +1108,14 @@ def probe_collection_item(col_id: str, idx: int = 0, owner: str = Depends(auth))
 
 
 @app.get("/collections/{col_id}/zip")
-def collection_zip(col_id: str, owner: str = Depends(auth)):
-    col = _own_collection(col_id, owner)
+def collection_zip(col_id: str, t: str | None = None,
+                   x_api_key: str | None = Header(default=None)):
+    if t and check_link("c", col_id, t):
+        col = colls.get(col_id)
+        if not col:
+            raise HTTPException(404, "المجموعة غير موجودة")
+    else:
+        col = _own_collection(col_id, auth(x_api_key))
     if col.state not in ("done", "partial"):
         raise HTTPException(409, "المجموعة لم تنتهِ بعد")
     entries, total = colls.zip_entries(col)
