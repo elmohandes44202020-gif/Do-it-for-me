@@ -137,17 +137,38 @@ def _reset() -> None:
 
 
 def _folder(m: Any) -> Any:
-    """مجلد مستهدف داخل ميجا (يُنشأ مرة واحدة)."""
+    """معرّف مجلد MEGA (str) أو None للرفع إلى الجذر.
+
+    mega.py: find(name) يعيد (handle, node) — وليس handle مباشرة،
+    و create_folder(name) يعيد {name: handle}. الخطأ القديم كان يمرّر أول حرف
+    من الـhandle ⇒ MEGA ترد -11 (ENOENT).
+    """
     try:
-        node = m.find(FOLDER)
-        if node:
-            return node[0]
+        hit = m.find(FOLDER)
+        handle = None
+        if isinstance(hit, (tuple, list)) and hit:
+            node = hit[1] if len(hit) > 1 else None
+            if isinstance(node, dict) and node.get("t") not in (None, 1):
+                handle = None                     # ملف وليس مجلدًا
+            else:
+                handle = hit[0]
+        elif isinstance(hit, dict):
+            handle = list(hit.keys())[0] if hit else None
+        elif isinstance(hit, str):
+            handle = hit
+        if isinstance(handle, str) and handle:
+            return handle
     except Exception:
         pass
     try:
-        return m.create_folder(FOLDER)
+        made = m.create_folder(FOLDER)
+        if isinstance(made, dict):
+            for _k, v in made.items():
+                if isinstance(v, str) and v:
+                    return v
     except Exception:
-        return None
+        pass
+    return None
 
 
 def upload(path: str, remote_name: str,
@@ -161,7 +182,17 @@ def upload(path: str, remote_name: str,
             on_state(state="uploading", percent=0)
             m = client if client is not None else _client()
             dest = _folder(m)
-            handle = m.upload(path, dest, dest_filename=remote_name)
+            try:
+                handle = m.upload(path, dest, dest_filename=remote_name)
+            except Exception as first:               # noqa: BLE001
+                low = str(first).lower()
+                if dest and ("enoent" in low or "-11" in low or "not found" in low):
+                    on_state(state="uploading", percent=0,
+                             error="مجلد MEGA غير متاح — نرفع إلى الجذر")
+                    dest = None
+                    handle = m.upload(path, None, dest_filename=remote_name)
+                else:
+                    raise
             link = ""
             try:
                 link = m.get_upload_link(handle) or ""
@@ -185,7 +216,9 @@ def upload(path: str, remote_name: str,
             _reset()
             msg = f"{type(e).__name__}: {e}"
             low = msg.lower()
-            if "password" in low or "credentials" in low or "login" in low:
+            if "enoent" in low or "object (typically" in low:
+                msg = "تعذّر رفع الملف إلى MEGA: مسار الحفظ غير صالح (ENOENT -11)"
+            elif "password" in low or "credentials" in low or "login" in low:
                 msg = "بيانات دخول ميجا غير صحيحة (MEGA_EMAIL / MEGA_PASSWORD)"
             on_state(state="error", percent=0, error=msg[:300],
                      seconds=round(time.time() - t0, 1))
