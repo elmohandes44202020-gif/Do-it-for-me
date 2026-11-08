@@ -339,3 +339,52 @@ def upload_with(client: Any, path: str, remote_name: str,
                 on_state: Callable[..., None]) -> threading.Thread:
     """نفس upload لكن بعميل جلسة محددة (بيانات الحساب لا تُخزَّن)."""
     return upload(path, remote_name, on_state, client=client)
+
+
+def upload_folder(client: Any, files: list[dict], folder_name: str,
+                  on_state: Callable[..., None]) -> threading.Thread:
+    """يرفع مجموعة ملفات كمجلد واحد باسم الدفتر، ويعيد رابط المجلد."""
+
+    def worker() -> None:
+        t0 = time.time()
+        try:
+            on_state(state="uploading", percent=0)
+            m = client if client is not None else _client()
+            parent = _folder(m)
+            handle = None
+            try:
+                made = m.create_folder(folder_name, dest=parent) if parent else m.create_folder(folder_name)
+                if isinstance(made, dict):
+                    for _k, v in made.items():
+                        if isinstance(v, str) and v:
+                            handle = v
+            except Exception:
+                handle = None
+            total = max(1, len(files))
+            done = 0
+            for f in files:
+                path = f.get("path")
+                name = f.get("name") or os.path.basename(path or "")
+                if not path or not os.path.exists(path):
+                    continue
+                try:
+                    m.upload(path, handle, dest_filename=name)
+                except Exception:
+                    m.upload(path, None, dest_filename=name)     # الجذر كخطة بديلة
+                done += 1
+                on_state(state="uploading", percent=int(done * 100 / total))
+            link = ""
+            try:
+                link = m.get_folder_link(handle) or ""
+            except Exception:
+                link = ""
+            on_state(state="done", percent=100, link=link, folder_link=link,
+                     seconds=round(time.time() - t0, 1))
+        except Exception as e:                       # noqa: BLE001
+            _reset()
+            on_state(state="error", percent=0, error=f"{type(e).__name__}: {e}"[:300],
+                     seconds=round(time.time() - t0, 1))
+
+    t = threading.Thread(target=worker, name="mega-folder", daemon=True)
+    t.start()
+    return t

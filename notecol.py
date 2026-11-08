@@ -136,6 +136,8 @@ class Collection:
     mega_percent: int = 0
     mega_bytes: int = 0
     mega_seconds: float = 0.0
+    # طريقة التسليم: zip = ملف واحد مضغوط · folder = مجلد باسم الدفتر
+    delivery: str = "zip"
     sort_seconds: float = 0.0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _zip: tuple[list[zipstream.Entry], int] | None = field(default=None, repr=False)
@@ -203,8 +205,15 @@ class Collection:
             "sorted_dir": SORTED,
             "match": self.match,
             "zip_url": f"{base}/collections/{self.id}/zip"
-                       if self.state in ("done", "partial") and c["done"] else None,
+                       if (self.delivery != "folder" and self.state in ("done", "partial")
+                           and c["done"]) else None,
             "error": self.error,
+            "delivery": self.delivery,
+            "folder_name": self.name if self.delivery == "folder" else None,
+            "files": ([{"idx": e["idx"], "name": e["name"], "size": e["size"]}
+                       for e in self.order]
+                      if self.delivery == "folder" and self.state in ("done", "partial")
+                      else None),
             "unmatched_lines": self.unmatched_lines[:30],
             "unplaced_items": self.unplaced_items[:30],
             "log": self.log[-40:],
@@ -422,22 +431,32 @@ def _finalize(col: Collection) -> None:
                 os.remove(dest)
             os.replace(it.mp3, dest)          # «نقل» فعلي بالترتيب
             it.mp3 = dest
-            crc, size = zipstream.crc_of(dest)
+            if col.delivery == "folder":
+                crc, size = 0, os.path.getsize(dest)
+            else:
+                crc, size = zipstream.crc_of(dest)
             entries.append({"order": it.order, "name": name, "path": dest,
-                            "size": size, "crc": crc})
+                            "size": size, "crc": crc, "idx": it.idx})
             time.sleep(MOVE_DELAY)            # 150ms بين كل نقل وملف
         col.order = entries
-        col._zip = ([zipstream.Entry(name=e["name"], path=e["path"],
-                                     size=e["size"], crc=e["crc"]) for e in entries],
-                    zipstream.zip_size([zipstream.Entry(name=e["name"], path=e["path"],
-                                                        size=e["size"], crc=e["crc"])
-                                        for e in entries]))
+        if col.delivery == "folder":
+            col._zip = None                    # مجلد بلا ضغط
+        else:
+            col._zip = ([zipstream.Entry(name=e["name"], path=e["path"],
+                                         size=e["size"], crc=e["crc"]) for e in entries],
+                        zipstream.zip_size([zipstream.Entry(name=e["name"], path=e["path"],
+                                                            size=e["size"], crc=e["crc"])
+                                            for e in entries]))
         col.sort_seconds = time.time() - t0
         col.finished_at = time.time()
         c = col.counts()
         col.state = "done" if c["error"] == 0 else "partial"
-        col.note(f"🗜️ ZIP جاهز · {len(entries)} ملف · "
-                 f"{sum(e['size'] for e in entries)/1048576:.1f} م.ب")
+        if col.delivery == "folder":
+            col.note(f"📁 المجلد جاهز · {len(entries)} ملف · "
+                     f"{sum(e['size'] for e in entries)/1048576:.1f} م.ب")
+        else:
+            col.note(f"🗜️ ZIP جاهز · {len(entries)} ملف · "
+                     f"{sum(e['size'] for e in entries)/1048576:.1f} م.ب")
     except Exception as e:                    # noqa: BLE001
         col.state = "partial"
         col.error = f"{type(e).__name__}: {e}"
@@ -446,12 +465,13 @@ def _finalize(col: Collection) -> None:
 
 # ─────────────────────────────── API ───────────────────────────────
 def create(owner: str, name: str, items: Iterable[dict], order_text: str = "",
-           match: float | None = None) -> Collection:
+           match: float | None = None, delivery: str = "zip") -> Collection:
     os.makedirs(COLS_DIR, exist_ok=True)
     col = Collection(id=uuid.uuid4().hex[:12], owner=owner,
                      name=media.safe_name(name, 0, "notebooklm-audio"))
     col.match = min(0.80, max(0.50, float(match if match is not None else MATCH_DEFAULT)))
     col.order_text = order_text or ""
+    col.delivery = "folder" if str(delivery).lower() in ("folder", "dir", "directory") else "zip"
     for idx, raw in enumerate(items):
         if idx >= MAX_ITEMS:
             break

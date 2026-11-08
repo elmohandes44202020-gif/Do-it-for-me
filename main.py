@@ -411,7 +411,7 @@ def diag(_owner: str = Depends(auth)) -> dict:
 
     return {
         "ok": True,
-        "version": "0.7.4",
+        "version": "0.8.0",
         "uptime_sec": round(now - STARTED_AT, 1),
         "mega": mega_up.info(),
         "memory": {"rss_mb": rss_mb,
@@ -432,7 +432,7 @@ def healthz() -> dict:
     return {
         "ok": True,
         "service": "notebooklm-mp3",
-        "version": "0.7.4",
+        "version": "0.8.0",
         "python": sys.version.split()[0],
         "pyav": getattr(_av, "__version__", "?"),
         "jobs": len(JOBS),
@@ -533,7 +533,7 @@ def diagnose(req: DiagnoseRequest, owner: str = Depends(auth)) -> dict:
         "referer_sent": bool(req.referer),
         "server": {
             "service": "notebooklm-mp3",
-            "version": "0.7.4",
+            "version": "0.8.0",
             "python": sys.version.split()[0],
             "platform": platform.platform(),
             "pyav": getattr(_av, "__version__", "?"),
@@ -987,6 +987,7 @@ class CollectionRequest(BaseModel):
     name: str = "notebooklm-audio"
     order_text: str = ""
     match: float | None = None
+    delivery: str = "zip"          # zip | folder
     files: list[CollectionItem] = Field(default_factory=list)
 
 
@@ -1014,6 +1015,12 @@ def _signed(d: dict, base: str) -> dict:
     if d.get("zip_url") and base:
         d["zip_url_signed"] = f"{base}/collections/{d['id']}/zip?t={sign_link('c', d['id'])}"
         d["link_expires_in_sec"] = LINK_TTL_SEC
+    if d.get("delivery") == "folder" and base and d.get("files"):
+        for f in d["files"]:
+            f["url"] = (f"{base}/collections/{d['id']}/file/{f['idx']}"
+                        f"?t={sign_link('f', str(d['id']) + ':' + str(f['idx']))}")
+            f["url_signed"] = f["url"]
+        d["link_expires_in_sec"] = LINK_TTL_SEC
     return d
 
 
@@ -1028,13 +1035,14 @@ def create_collection(req: CollectionRequest, owner: str = Depends(auth)) -> dic
         raise HTTPException(400, "روابط غير صالحة: " + "، ".join(missing[:5]))
     col = colls.create(
         owner, req.name, [f.model_dump() for f in req.files],
-        order_text=req.order_text, match=req.match,
+        order_text=req.order_text, match=req.match, delivery=req.delivery,
     )
     return {
         "collection_id": col.id,
         "count": len(col.items),
         "state": col.state,
         "match": col.match,
+        "delivery": col.delivery,
     }
 
 
@@ -1177,6 +1185,17 @@ def mega_upload_collection(col_id: str, owner: str = Depends(auth),
 
     def worker() -> None:
         try:
+            if col.delivery == "folder":
+                payload = [{"path": e["path"], "name": e["name"]}
+                           for e in col.order if os.path.exists(e.get("path", ""))]
+                col.mega_bytes = sum(int(e.get("size") or 0) for e in col.order)
+                col.note(f"☁️ رفع مجلد «{col.name}» ({len(payload)} ملف) إلى MEGA…")
+                cli = mega_up.session(sid)["client"] if sess is not None else None
+                mega_up.upload_folder(cli, payload, col.name, on_state)
+                if sess is not None and (req.wipe_after if req else True):
+                    mega_up.drop_session(sid)
+                    col.note("🔒 مُسحت بيانات الجلسة من ذاكرة السيرفر")
+                return
             files, size = mega_up.build_zip(zip_path, col.order)
             col.mega_bytes = size
             if files == 0:
@@ -1322,6 +1341,91 @@ def _skip_bytes(gen, skip: int):
             continue
         dropped = skip
         yield chunk[need:]
+
+
+@app.get("/collections/{col_id}/file/{idx}")
+def collection_file(col_id: str, idx: int, t: str | None = None,
+                    range_header: str | None = Header(default=None, alias="Range"),
+                    x_api_key: str | None = Header(default=None)):
+    """تنزيل ملف واحد من مجلد التسليم (يدعم الاستئناف)."""
+    authed = False
+    if t and check_link("f", f"{col_id}:{idx}", t):
+        authed = True
+    else:
+        try:
+            owner = auth(x_api_key)
+            col0 = colls.get(col_id)
+            if col0 is not None and col0.owner == owner:
+                authed = True
+        except HTTPException:
+            authed = False
+    if not authed:
+        raise HTTPException(401, "غير مصرّح")
+
+    col = colls.get(col_id)
+    if col is None:
+        raise HTTPException(404, "المجموعة غير موجودة")
+    if col.delivery != "folder":
+        raise HTTPException(409, "هذه المجموعة مهيّأة كملف ZIP")
+    if col.state not in ("done", "partial"):
+        raise HTTPException(409, "المجموعة لم تنتهِ بعد")
+    entry = next((e for e in col.order if int(e.get("idx", -1)) == idx), None)
+    if entry is None:
+        # idx هنا ترتيب العنصر الأصلي — نبحث أيضًا بالفهرس داخل col.order
+        if 0 <= idx < len(col.order):
+            entry = col.order[idx]
+    if entry is None or not os.path.exists(entry["path"]):
+        raise HTTPException(404, "الملف غير موجود")
+    path = entry["path"]
+    size = os.path.getsize(path)
+    start, end = 0, max(0, size - 1)
+    partial = bool(range_header)
+    if range_header:
+        try:
+            part = range_header.strip().lower().replace("bytes=", "").split(",")[0]
+            a, _, b = part.partition("-")
+            if a.strip():
+                start = max(0, min(int(a), max(0, size - 1)))
+            if b.strip():
+                end = min(int(b), max(0, size - 1))
+            if end < start:
+                end = max(0, size - 1)
+        except Exception:
+            start, end = 0, max(0, size - 1)
+    if size == 0:
+        return StreamingResponse(iter(()), status_code=200,
+                                 media_type="audio/mpeg",
+                                 headers={"Content-Length": "0",
+                                          "X-Total-Bytes": "0"})
+    length = end - start + 1
+    headers = {"Content-Disposition": cd_header(entry["name"]),
+               "Content-Length": str(length),
+               "Accept-Ranges": "bytes",
+               "Cache-Control": "no-store",
+               "X-Total-Bytes": str(size)}
+    if partial:
+        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+    return StreamingResponse(
+        _file_range(path, start, end), status_code=206 if partial else 200,
+        media_type="audio/mpeg", headers=headers)
+
+
+def _file_range(path: str, start: int, end: int | None = None,
+                chunk: int = 1 << 16):
+    with open(path, "rb") as fh:
+        if start:
+            fh.seek(start)
+        left = None if end is None else end - start + 1
+        while True:
+            want = chunk if left is None else min(chunk, left)
+            if want <= 0:
+                break
+            data = fh.read(want)
+            if not data:
+                break
+            if left is not None:
+                left -= len(data)
+            yield data
 
 
 @app.delete("/collections/{col_id}")
