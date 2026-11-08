@@ -411,7 +411,7 @@ def diag(_owner: str = Depends(auth)) -> dict:
 
     return {
         "ok": True,
-        "version": "0.7.2",
+        "version": "0.7.3",
         "uptime_sec": round(now - STARTED_AT, 1),
         "mega": mega_up.info(),
         "memory": {"rss_mb": rss_mb,
@@ -432,7 +432,7 @@ def healthz() -> dict:
     return {
         "ok": True,
         "service": "notebooklm-mp3",
-        "version": "0.7.2",
+        "version": "0.7.3",
         "python": sys.version.split()[0],
         "pyav": getattr(_av, "__version__", "?"),
         "jobs": len(JOBS),
@@ -533,7 +533,7 @@ def diagnose(req: DiagnoseRequest, owner: str = Depends(auth)) -> dict:
         "referer_sent": bool(req.referer),
         "server": {
             "service": "notebooklm-mp3",
-            "version": "0.7.2",
+            "version": "0.7.3",
             "python": sys.version.split()[0],
             "platform": platform.platform(),
             "pyav": getattr(_av, "__version__", "?"),
@@ -1268,6 +1268,7 @@ def probe_collection_item(col_id: str, idx: int = 0, owner: str = Depends(auth))
 
 @app.get("/collections/{col_id}/zip")
 def collection_zip(col_id: str, t: str | None = None,
+                   range_header: str | None = Header(default=None, alias="Range"),
                    x_api_key: str | None = Header(default=None)):
     if t and check_link("c", col_id, t):
         col = colls.get(col_id)
@@ -1286,9 +1287,41 @@ def collection_zip(col_id: str, t: str | None = None,
         "X-Total-Bytes": str(total),
         "X-Files": str(len(entries)),
         "Cache-Control": "no-store",
+        "Accept-Ranges": "bytes",
     }
+    # دعم الاستئناف: Range: bytes=START-  → 206 مع تخطي START بايت من البث
+    start = 0
+    if range_header:
+        try:
+            part = range_header.strip().lower().replace("bytes=", "")
+            first = part.split(",")[0].split("-")[0].strip()
+            if first:
+                start = max(0, min(int(first), total))
+        except Exception:
+            start = 0
+    if start > 0:
+        body = _skip_bytes(colls.zipstream.stream_zip(entries), start)
+        headers["Content-Length"] = str(total - start)
+        headers["Content-Range"] = f"bytes {start}-{total - 1}/{total}"
+        return StreamingResponse(body, status_code=206,
+                                 media_type="application/zip", headers=headers)
     return StreamingResponse(colls.zipstream.stream_zip(entries),
                              media_type="application/zip", headers=headers)
+
+
+def _skip_bytes(gen, skip: int):
+    """يتخطى أول `skip` بايت من مولد البث (لا يقرأ الملفات من جديد)."""
+    dropped = 0
+    for chunk in gen:
+        if dropped >= skip:
+            yield chunk
+            continue
+        need = skip - dropped
+        if len(chunk) <= need:
+            dropped += len(chunk)
+            continue
+        dropped = skip
+        yield chunk[need:]
 
 
 @app.delete("/collections/{col_id}")
