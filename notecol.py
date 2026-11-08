@@ -134,6 +134,12 @@ class Collection:
     mega_folder_link: str = ""
     mega_error: str = ""
     mega_percent: int = 0
+    mega_files_done: int = 0
+    mega_files_total: int = 0
+    mega_current: str = ""
+    mega_skipped: int = 0
+    mega_folder: str = ""
+    mega_sub: str = ""
     mega_bytes: int = 0
     mega_seconds: float = 0.0
     # طريقة التسليم: zip = ملف واحد مضغوط · folder = مجلد باسم الدفتر
@@ -225,6 +231,12 @@ class Collection:
                 "folder_link": self.mega_folder_link,
                 "error": self.mega_error,
                 "percent": self.mega_percent,
+                "files_done": self.mega_files_done,
+                "files_total": self.mega_files_total,
+                "current": self.mega_current,
+                "skipped": self.mega_skipped,
+                "folder": self.mega_folder,
+                "subfolder": self.mega_sub,
                 "bytes": self.mega_bytes,
                 "seconds": self.mega_seconds,
             },

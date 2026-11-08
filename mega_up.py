@@ -262,7 +262,7 @@ except Exception:                      # noqa: BLE001
     _RSA_OK = False
 
 SESSIONS: dict[str, dict] = {}
-SESS_TTL = 30 * 60
+SESS_TTL = int(os.environ.get("MEGA_SESS_TTL_MIN", "720")) * 60   # 12 ساعة افتراضيًا
 
 
 def rsa_available() -> bool:
@@ -341,49 +341,111 @@ def upload_with(client: Any, path: str, remote_name: str,
     return upload(path, remote_name, on_state, client=client)
 
 
+SORTED_NAME = (os.environ.get("SORTED_DIRNAME") or "تم الترتيب").strip() or "تم الترتيب"
+
+
+def _handle_of(made: Any) -> str | None:
+    """create_folder يعيد {name: handle} — نستخرج الـhandle بأمان."""
+    if isinstance(made, dict):
+        for v in made.values():
+            if isinstance(v, str) and v:
+                return v
+    if isinstance(made, str) and made:
+        return made
+    return None
+
+
+def _ensure_folder(m: Any, name: str, parent: str | None) -> str:
+    """يجد مجلدًا بالاسم داخل الأب أو يُنشئه، ويعيد الـhandle. يرفع استثناءً عند الفشل."""
+    try:
+        files = m.get_files() or {}
+        for _h, info in files.items():
+            if info.get("t") == 1 or info.get("t") == 2:      # 1/2 = مجلد
+                a = info.get("a") or {}
+                if a.get("n") == name and (parent is None or info.get("p") == parent):
+                    return _h
+    except Exception:
+        pass
+    try:
+        made = m.create_folder(name, dest=parent) if parent else m.create_folder(name)
+    except TypeError:
+        made = m.create_folder(name)
+    handle = _handle_of(made)
+    if not handle:
+        raise RuntimeError(f"تعذّر إنشاء مجلد «{name}» على MEGA")
+    return handle
+
+
+def _children(m: Any, parent: str) -> dict[str, int]:
+    """{اسم: حجم} للملفات الموجودة داخل مجلد — للاستئناف بلا تكرار."""
+    out: dict[str, int] = {}
+    try:
+        files = m.get_files() or {}
+    except Exception:
+        return out
+    for _h, info in files.items():
+        if info.get("p") == parent and info.get("t") == 0:
+            a = info.get("a") or {}
+            nm = a.get("n")
+            if nm:
+                out[str(nm)] = int(info.get("s") or 0)
+    return out
+
+
 def upload_folder(client: Any, files: list[dict], folder_name: str,
                   on_state: Callable[..., None]) -> threading.Thread:
-    """يرفع مجموعة ملفات كمجلد واحد باسم الدفتر، ويعيد رابط المجلد."""
+    """يرفع الملفات داخل: مجلد باسم الدفتر ← مجلد «تم الترتيب» ← الملفات.
+
+    - لا رفع إلى جذر الحساب إطلاقًا (كان سبب تناثر الملفات في الجذر).
+    - يستأنف بلا تكرار: يتخطى ما هو موجود بنفس الاسم والحجم.
+    - يبلّغ بالتقدم: percent + files_done/files_total + current.
+    """
 
     def worker() -> None:
         t0 = time.time()
         try:
-            on_state(state="uploading", percent=0)
+            on_state(state="uploading", percent=0, files_done=0, files_total=len(files),
+                     current="")
             m = client if client is not None else _client()
-            parent = _folder(m)
-            handle = None
-            try:
-                made = m.create_folder(folder_name, dest=parent) if parent else m.create_folder(folder_name)
-                if isinstance(made, dict):
-                    for _k, v in made.items():
-                        if isinstance(v, str) and v:
-                            handle = v
-            except Exception:
-                handle = None
+            parent = _folder(m)                      # مجلد NoteWorm (قد يكون None)
+            root = _ensure_folder(m, folder_name, parent)
+            inner = _ensure_folder(m, SORTED_NAME, root)
             total = max(1, len(files))
             done = 0
+            skipped = 0
+            existing = _children(m, inner)
             for f in files:
                 path = f.get("path")
                 name = f.get("name") or os.path.basename(path or "")
                 if not path or not os.path.exists(path):
                     continue
-                try:
-                    m.upload(path, handle, dest_filename=name)
-                except Exception:
-                    m.upload(path, None, dest_filename=name)     # الجذر كخطة بديلة
+                size = os.path.getsize(path)
+                on_state(state="uploading", percent=int(done * 100 / total),
+                         files_done=done, files_total=total, current=name)
+                if existing.get(name) == size:
+                    skipped += 1
+                else:
+                    m.upload(path, inner, dest_filename=name)
                 done += 1
-                on_state(state="uploading", percent=int(done * 100 / total))
+                on_state(state="uploading", percent=int(done * 100 / total),
+                         files_done=done, files_total=total, current=name)
             link = ""
+            inner_link = ""
             try:
-                link = m.get_folder_link(handle) or ""
+                link = m.get_folder_link(root) or ""
             except Exception:
                 link = ""
-            on_state(state="done", percent=100, link=link, folder_link=link,
-                     seconds=round(time.time() - t0, 1))
+            try:
+                inner_link = m.get_folder_link(inner) or ""
+            except Exception:
+                inner_link = ""
+            on_state(state="done", percent=100, link=link or inner_link,
+                     folder_link=link or inner_link, files_done=done, files_total=total,
+                     skipped=skipped, folder=folder_name, subfolder=SORTED_NAME,
+                     current="", seconds=round(time.time() - t0, 1))
         except Exception as e:                       # noqa: BLE001
-            _reset()
             on_state(state="error", percent=0, error=f"{type(e).__name__}: {e}"[:300],
-                     seconds=round(time.time() - t0, 1))
+                     current="", seconds=round(time.time() - t0, 1))
 
     t = threading.Thread(target=worker, name="mega-folder", daemon=True)
     t.start()

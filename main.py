@@ -411,7 +411,7 @@ def diag(_owner: str = Depends(auth)) -> dict:
 
     return {
         "ok": True,
-        "version": "0.8.0",
+        "version": "0.8.1",
         "uptime_sec": round(now - STARTED_AT, 1),
         "mega": mega_up.info(),
         "memory": {"rss_mb": rss_mb,
@@ -432,7 +432,7 @@ def healthz() -> dict:
     return {
         "ok": True,
         "service": "notebooklm-mp3",
-        "version": "0.8.0",
+        "version": "0.8.1",
         "python": sys.version.split()[0],
         "pyav": getattr(_av, "__version__", "?"),
         "jobs": len(JOBS),
@@ -533,7 +533,7 @@ def diagnose(req: DiagnoseRequest, owner: str = Depends(auth)) -> dict:
         "referer_sent": bool(req.referer),
         "server": {
             "service": "notebooklm-mp3",
-            "version": "0.8.0",
+            "version": "0.8.1",
             "python": sys.version.split()[0],
             "platform": platform.platform(),
             "pyav": getattr(_av, "__version__", "?"),
@@ -1077,7 +1077,7 @@ class MegaSessionReq(BaseModel):
 
 class MegaUploadReq(BaseModel):
     session_id: str = ""
-    wipe_after: bool = True
+    wipe_after: bool = False        # الجلسة تبقى للاستخدام التالي (لا نطلب كلمة السر كل مرة)
 
 
 @app.get("/mega/key")
@@ -1135,7 +1135,7 @@ def mega_upload_collection(col_id: str, owner: str = Depends(auth),
     sess = mega_up.session(sid) if sid else None
     if sess is None and not mega_up.enabled():
         raise HTTPException(status_code=400, detail=(
-            "لا توجد بيانات ميجا: افتح رفع mيجا من التطبيق وأدخل بريدك مرة واحدة "
+            "لا توجد بيانات ميجا: افتح رفع ميجا من التطبيق وأدخل بريدك مرة واحدة "
             "(تُرسَل مشفّرة ولا تُخزَّن)، أو اضبط MEGA_EMAIL/MEGA_PASSWORD."))
     if col.state not in ("done", "partial") or not col.order:
         raise HTTPException(status_code=409, detail="المجموعة لم تنتهِ بعد")
@@ -1153,6 +1153,12 @@ def mega_upload_collection(col_id: str, owner: str = Depends(auth),
     remote = (col.name or "notebooklm-audio") + ".zip"
     col.mega_state = "uploading"
     col.mega_percent = 0
+    col.mega_files_done = 0
+    col.mega_files_total = len(col.order)
+    col.mega_current = ""
+    col.mega_skipped = 0
+    col.mega_folder = col.name or ""
+    col.mega_sub = ""
     col.mega_error = ""
     col.mega_link = ""
     col.note("☁️ بدء الرفع إلى MEGA…")
@@ -1163,6 +1169,18 @@ def mega_upload_collection(col_id: str, owner: str = Depends(auth),
             col.mega_state = st
         if kw.get("percent") is not None:
             col.mega_percent = int(kw.get("percent") or 0)
+        if kw.get("files_done") is not None:
+            col.mega_files_done = int(kw.get("files_done") or 0)
+        if kw.get("files_total") is not None:
+            col.mega_files_total = int(kw.get("files_total") or 0)
+        if kw.get("current") is not None:
+            col.mega_current = str(kw.get("current") or "")
+        if kw.get("skipped") is not None:
+            col.mega_skipped = int(kw.get("skipped") or 0)
+        if kw.get("folder"):
+            col.mega_folder = str(kw["folder"])
+        if kw.get("subfolder"):
+            col.mega_sub = str(kw["subfolder"])
         if kw.get("link"):
             col.mega_link = str(kw["link"])
         if kw.get("folder_link"):
@@ -1173,7 +1191,10 @@ def mega_upload_collection(col_id: str, owner: str = Depends(auth),
             col.mega_seconds = float(kw["seconds"])
         if st == "done":
             col.mega_percent = 100
-            col.note("☁️ تم الرفع إلى MEGA بنجاح")
+            col.mega_current = ""
+            col.note(f"☁️ تم الرفع إلى MEGA: /{col.mega_folder}/{col.mega_sub or ''}"
+                     f" — {col.mega_files_done} ملف"
+                     + (f" (تُخطّي {col.mega_skipped} موجود)" if col.mega_skipped else ""))
         elif st == "error":
             col.note("❌ فشل الرفع إلى MEGA: " + col.mega_error[:120])
         if st in ("done", "error"):
@@ -1192,7 +1213,7 @@ def mega_upload_collection(col_id: str, owner: str = Depends(auth),
                 col.note(f"☁️ رفع مجلد «{col.name}» ({len(payload)} ملف) إلى MEGA…")
                 cli = mega_up.session(sid)["client"] if sess is not None else None
                 mega_up.upload_folder(cli, payload, col.name, on_state)
-                if sess is not None and (req.wipe_after if req else True):
+                if sess is not None and (req.wipe_after if req else False):
                     mega_up.drop_session(sid)
                     col.note("🔒 مُسحت بيانات الجلسة من ذاكرة السيرفر")
                 return
@@ -1204,7 +1225,7 @@ def mega_upload_collection(col_id: str, owner: str = Depends(auth),
             if sess is not None:
                 mega_up.upload_with(sess["client"], zip_path, remote, on_state)
                 sess["uploads"] = int(sess.get("uploads", 0)) + 1
-                if (req.wipe_after if req else True) and sess.get("uploads", 0) >= 1:
+                if (req.wipe_after if req else False) and sess.get("uploads", 0) >= 1:
                     mega_up.drop_session(sid)          # مسح الجلسة بعد الاستخدام
                     col.note("🔒 مُسحت بيانات الجلسة من ذاكرة السيرفر")
             else:
@@ -1226,10 +1247,20 @@ def mega_upload_collection(col_id: str, owner: str = Depends(auth),
 @app.get("/collections/{col_id}/mega")
 def mega_state(col_id: str, owner: str = Depends(auth)) -> dict:
     col = _own_collection(col_id, owner)
+    if not col.mega_files_total:
+        col.mega_files_total = len(col.order)
+    if not col.mega_folder:
+        col.mega_folder = col.name or ""
+    if not col.mega_sub:
+        col.mega_sub = mega_up.SORTED_NAME if col.delivery == "folder" else ""
     return {"enabled": mega_up.enabled(), "state": col.mega_state,
             "link": col.mega_link, "folder_link": col.mega_folder_link,
             "error": col.mega_error, "percent": col.mega_percent,
-            "bytes": col.mega_bytes, "seconds": col.mega_seconds}
+            "files_done": col.mega_files_done, "files_total": col.mega_files_total,
+            "current": col.mega_current, "skipped": col.mega_skipped,
+            "folder": col.mega_folder, "subfolder": col.mega_sub,
+            "bytes": col.mega_bytes, "seconds": col.mega_seconds,
+            "session_alive": mega_up.live_sessions() > 0}
 
 
 @app.post("/collections/{col_id}/order")
