@@ -61,16 +61,26 @@ def install_net_timeouts() -> None:
     try:
         import requests
 
-        def _wrap(original):
+        # 0.9.7 (بلاغ «السيرفر حجب الاتصال»): كان الخطان يُغلَّفان بنفس الدالة،
+        # وrequests.api.request بلا self ⇒ TypeError: missing 'url' ⇒ فشل تسجيل الدخول
+        # لكل من يستخدم requests.post/get (وهو ما يفعله mega.py) ⇒ رسالة «شبكة/حجب» مضلّلة.
+        def _wrap_session(original):
             def request(self, method, url, **kw):
                 if kw.get("timeout") is None:
                     kw["timeout"] = (CONNECT_TIMEOUT, READ_TIMEOUT)
                 return original(self, method, url, **kw)
             return request
 
-        requests.Session.request = _wrap(requests.Session.request)
+        def _wrap_api(original):
+            def request(method, url, **kw):
+                if kw.get("timeout") is None:
+                    kw["timeout"] = (CONNECT_TIMEOUT, READ_TIMEOUT)
+                return original(method, url, **kw)
+            return request
+
+        requests.Session.request = _wrap_session(requests.Session.request)
         try:
-            requests.api.request = _wrap(requests.api.request)
+            requests.api.request = _wrap_api(requests.api.request)
         except Exception:
             pass
         _TIMEOUTS_PATCHED = True
@@ -387,6 +397,125 @@ def mask(email: str) -> str:
     return keep + "•" * max(2, len(name) - len(keep)) + ("@" + dom if dom else "")
 
 
+PROXY_ENV = (os.environ.get("MEGA_PROXY") or os.environ.get("HTTPS_PROXY")
+             or os.environ.get("HTTP_PROXY") or "").strip()
+API_HOSTS = [h.strip() for h in (os.environ.get("MEGA_API_HOSTS")
+                                 or "g.api.mega.co.nz,eu.api.mega.co.nz").split(",") if h.strip()]
+API_SCHEME = (os.environ.get("MEGA_API_SCHEME") or "https").strip() or "https"
+
+
+def _split_host(host: str) -> tuple[str, int]:
+    """"127.0.0.1:8899" ⇒ ("127.0.0.1", 8899) — لتسهيل الاختبار على خادم محلي."""
+    if ":" in host:
+        name, _, port = host.rpartition(":")
+        if port.isdigit():
+            return name, int(port)
+    return host, 443
+
+
+def apply_proxy() -> None:
+    """MEGA_PROXY ⇒ يمرّر الاتصال عبر بروكسي (mega.py يستخدم requests ويحترم متغيرات البيئة)."""
+    if not PROXY_ENV:
+        return
+    for var in ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"):
+        os.environ.setdefault(var, PROXY_ENV)
+
+
+def _probe(host: str, payload: list, timeout: tuple[int, int] = (10, 25)) -> tuple[int, str]:
+    """يضرب نقطة الـAPI بنفس شكل طلبات mega.py ويعيد (status, body)."""
+    import json as _json
+    import uuid as _uuid
+    import requests
+    apply_proxy()
+    r = requests.post(f"{API_SCHEME}://{host}/cs",
+                      params={"id": 0, "n": _uuid.uuid4().hex},
+                      data=_json.dumps(payload),
+                      headers={"Content-Type": "application/json"}, timeout=timeout)
+    return r.status_code, (r.text or "").strip()
+
+
+def diagnose() -> dict:
+    """فحص اتصال MEGA من السيرفر: DNS ← منفذ 443 ← رد الـAPI ← صلاحية تسجيل الدخول."""
+    import socket
+    import time
+    proxy = {k: (os.environ.get(k) or "") for k in
+             ("MEGA_PROXY", "HTTPS_PROXY", "HTTP_PROXY")}
+    rows: list[dict[str, Any]] = []
+    reachable = False
+    login_blocked = False
+    login_probe: dict[str, Any] = {}
+    for host in API_HOSTS:
+        row: dict[str, Any] = {"host": host, "dns": "", "tcp": False, "http": 0,
+                               "body": "", "error": "", "ms": 0}
+        t0 = time.time()
+        name, port = _split_host(host)
+        try:
+            row["dns"] = socket.getaddrinfo(name, port)[0][4][0]
+        except Exception:                            # noqa: BLE001
+            row["error"] = "فشل تحويل الاسم (DNS) — السيرفر قد يكون بلا DNS خارجي."
+            rows.append(row)
+            continue
+        try:
+            with socket.create_connection((name, port), timeout=8):
+                row["tcp"] = True
+        except Exception:                            # noqa: BLE001
+            row["error"] = "لا اتصال على المنفذ 443 — جدار ناري أو حجب صادر من الاستضافة."
+            rows.append(row)
+            continue
+        try:
+            code, body = _probe(host, [{"a": "g"}])
+            row["http"], row["body"] = code, body[:160]
+            # أي رد رقمي (حتى ‎-2/-3) يعني أن ميجا استقبلت الطلب وردّت ⇒ الاتصال يعمل
+            if code == 200 and body:
+                reachable = True
+            else:
+                row["error"] = "رد فارغ من ميجا — الطلب مرفوض."
+        except Exception as exc:                     # noqa: BLE001
+            row["error"] = "فشل طلب HTTPS إلى ميجا — " + type(exc).__name__
+        if not login_probe:
+            try:
+                lcode, lbody = _probe(host, [{"a": "us", "user": "probe@example.invalid",
+                                              "uh": "0" * 32}])
+                login_probe = {"host": host, "http": lcode, "body": lbody[:160]}
+                # 402/509 أو رد فارغ على تسجيل الدخول = ميجا ترفض العنوان (EAGAIN)
+                if lcode in (402, 509) or (lcode == 200 and not lbody):
+                    login_blocked = True
+            except Exception as exc:                 # noqa: BLE001
+                login_probe = {"host": host, "http": 0, "body": "",
+                               "error": type(exc).__name__}
+        row["ms"] = int((time.time() - t0) * 1000)
+        rows.append(row)
+
+    if FAKE:
+        return {"ok": True, "fake": True, "proxy": proxy, "hosts": rows,
+                "login": login_probe, "reachable": reachable, "login_blocked": False,
+                "verdict": "وضع الاختبار مفعّل (NW_FAKE_MEGA) — لا اتصال حقيقي بميجا.",
+                "advice": "عطّل NW_FAKE_MEGA لاختبار الاتصال الحقيقي."}
+    if not reachable:
+        if all(not r["tcp"] for r in rows):
+            verdict = "السيرفر لا يستطيع فتح اتصال بميجا على المنفذ 443."
+            advice = ("الاستضافة تحجب الاتصال الصادر: اضبط MEGA_PROXY على السيرفر "
+                      "أو ارفع عبر تيليجرام من نفس الشاشة.")
+        else:
+            verdict = ("TCP يصل لميجا لكنها ترفض الطلبات من عنوان السيرفر "
+                       "(402 أو رد فارغ) — حجب على مستوى الطلبات.")
+            advice = ("اضبط MEGA_PROXY (بروكسي) أو ارفع عبر تيليجرام من نفس الشاشة، "
+                      "ثم أعد الفحص.")
+    elif login_blocked:
+        verdict = ("ميجا تستجيب للسيرفر لكنها ترفض تسجيل الدخول من عنوانه "
+                   "(402/EAGAIN — حجب أو ضغط على عنوان الاستضافة المشتركة).")
+        advice = ("الحل: (1) اضبط MEGA_PROXY على السيرفر ليمرّ الاتصال عبر بروكسي، "
+                  "(2) أو ارفع الباقة عبر تيليجرام — يعمل من نفس الخطوة، "
+                  "(3) أو أعد المحاولة بعد دقائق لأن EAGAIN مؤقتة أحيانًا.")
+    else:
+        verdict = "الاتصال بميجا سليم من السيرفر."
+        advice = "لو تعذّر الدخول بعدها فالسبب في البريد/كلمة المرور لا في الشبكة."
+    return {"ok": reachable and not login_blocked, "fake": False, "proxy": proxy,
+            "hosts": rows, "login": login_probe,
+            "reachable": reachable, "login_blocked": login_blocked,
+            "verdict": verdict, "advice": advice}
+
+
 def create_session(email: str, password: str) -> str:
     sid = base64.urlsafe_b64encode(os.urandom(18)).decode().rstrip("=")
     if FAKE:                                   # وضع الاختبار: جلسة بلا شبكة
@@ -399,10 +528,35 @@ def create_session(email: str, password: str) -> str:
         raise RuntimeError(
             "السيرفر يحتاج حزمة mega.py لتسجيل الدخول إلى ميجا — "
             "ثبّتها بأمر: pip install mega.py") from exc
-    try:
-        m = Mega().login(email, password)      # ميجا تُشفّر بيانات الدخول داخليًا
-    except Exception as exc:                   # noqa: BLE001
+    apply_proxy()
+    last_exc: Exception | None = None
+    for attempt in range(2):                   # EAGAIN من ميجا كثيرًا ما تكون مؤقتة
+        try:
+            m = Mega().login(email, password)  # ميجا تُشفّر بيانات الدخول داخليًا
+            last_exc = None
+            break
+        except Exception as exc:               # noqa: BLE001
+            last_exc = exc
+            low = str(exc).lower() + type(exc).__name__.lower()
+            transient = ("jsondecode" in low or "eagain" in low or "402" in low
+                         or "509" in low or "expecting value" in low)
+            if attempt == 0 and transient:
+                time.sleep(4)
+                continue
+            break
+    if last_exc is not None:
+        exc = last_exc
         low = str(exc).lower()
+        name = type(exc).__name__.lower()
+        if ("jsondecode" in name or "expecting value" in low or "eagain" in low
+                or "509" in low or "bandwidth" in low):
+            raise RuntimeError(
+                "ميجا رفضت الطلب من عنوان السيرفر (حجب/باندويث). اضبط MEGA_PROXY على السيرفر "
+                "أو استخدم تيليجرام كسحابة — اضغط «فحص اتصال ميجا» لمعرفة التفاصيل.") from exc
+        if ("connection" in low or "timed out" in low or "timeout" in low
+                or "getaddrinfo" in low or "ssl" in low):
+            raise RuntimeError(
+                "تعذّر الوصول إلى ميجا من السيرفر (شبكة/حجب) — اضبط MEGA_PROXY أو استخدم تيليجرام.") from exc
         if ("password" in low or "credential" in low or "login" in low
                 or "auth" in low or "user" in low or "email" in low):
             raise RuntimeError("بيانات دخول ميجا غير صحيحة — راجع البريد وكلمة المرور.") from exc

@@ -58,6 +58,12 @@ def main() -> int:
                 time.sleep(0.2)
         print("· إصدار السيرفر:", httpx.get(base + "/healthz").json()["version"])
 
+        # ⓪ فحص الاتصال (الزر الجديد في خطوة الرفع)
+        dg = httpx.get(base + "/mega/diag", headers=H, timeout=120).json()
+        print("· /mega/diag:", dg.get("verdict"))
+        assert "verdict" in dg and "advice" in dg and dg.get("fake") is True, dg
+        assert dg["ok"] is True, dg
+
         # ① دخول MEGA كما يفعل الهاتف بالضبط
         k = httpx.get(base + "/mega/key", headers=H, timeout=30).json()
         assert k.get("pubkey", "").startswith("-----BEGIN PUBLIC KEY-----"), k
