@@ -181,7 +181,17 @@ def main() -> int:
         assert inside == ["001 - مقدمة.mp4", "002 - مقدمة.ar.srt",
                           "003 - الانحدار.mp4", "004 - الانحدار.ar.srt"], inside
 
-        print("\nكل اختبارات التنزيل على السيرفر نجحت ✅  (0.9.4 — بلا تنزيل على الهاتف)")
+        # لوحة العمليات: صف التنزيل يعرض ما نُزّل فعلًا
+        ops = httpx.get(base + "/ops", headers=H, timeout=30).json()
+        row = next(x for x in ops["courses"] if x["id"] == cid)
+        dl = row["download"]
+        print(f"· /ops (تنزيل): «{row['name']}» {dl['state']} {dl['done']}/{dl['total']}"
+              f" · مدموج {dl['muxed']} · أخطاء {dl['errors_count']} · ملفات {len(dl['files_done'])}")
+        assert dl["state"] == "done" and dl["done"] == 3, dl
+        assert dl["muxed"] == 2 and dl["errors_count"] == 1, dl
+        assert len(dl["files_done"]) >= 4, dl
+
+        print("\nكل اختبارات التنزيل على السيرفر نجحت ✅  (0.9.5 — بلا تنزيل على الهاتف)")
         return 0
     finally:
         api.terminate()

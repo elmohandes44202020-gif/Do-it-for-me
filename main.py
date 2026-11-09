@@ -421,7 +421,7 @@ def diag(_owner: str = Depends(auth)) -> dict:
 
     return {
         "ok": True,
-        "version": "0.9.4",
+        "version": "0.9.5",
         "uptime_sec": round(now - STARTED_AT, 1),
         "mega": mega_up.info(),
         "memory": {"rss_mb": rss_mb,
@@ -442,7 +442,7 @@ def healthz() -> dict:
     return {
         "ok": True,
         "service": "notebooklm-mp3",
-        "version": "0.9.4",
+        "version": "0.9.5",
         "python": sys.version.split()[0],
         "pyav": getattr(_av, "__version__", "?"),
         "jobs": len(JOBS),
@@ -543,7 +543,7 @@ def diagnose(req: DiagnoseRequest, owner: str = Depends(auth)) -> dict:
         "referer_sent": bool(req.referer),
         "server": {
             "service": "notebooklm-mp3",
-            "version": "0.9.4",
+            "version": "0.9.5",
             "python": sys.version.split()[0],
             "platform": platform.platform(),
             "pyav": getattr(_av, "__version__", "?"),
@@ -1755,7 +1755,7 @@ def course_file(cid: str, idx: int, t: str | None = None,
     else:
         c = _own_course(cid, auth(x_api_key))
     row = next((e for e in c.order if int(e.get("order") or 0) == idx), None)
-    if row is None:                        # 0.9.4: قبل التغليف نخدم الملف بالمسودة
+    if row is None:                        # 0.9.5: قبل التغليف نخدم الملف بالمسودة
         f0 = next((f for f in c.files if int(f.idx) == idx), None)
         if f0 is not None:
             row = {"name": f0.name, "path": f0.path, "size": f0.size}
@@ -1792,7 +1792,7 @@ class FetchRequest(BaseModel):
 
 @app.post("/courses/{cid}/fetch", status_code=202)
 def fetch_course(cid: str, req: FetchRequest, owner: str = Depends(auth)) -> dict:
-    """0.9.4: السيرفر هو من ينزّل الفيديوهات والترجمات — لا تنزيل على الهاتف."""
+    """0.9.5: السيرفر هو من ينزّل الفيديوهات والترجمات — لا تنزيل على الهاتف."""
     c = _own_course(cid, owner)
     if c.state in ("packing", "ready"):
         raise HTTPException(409, "الباقة مقفلة — ابدأ باقة جديدة")
@@ -1815,23 +1815,108 @@ def course_delivery(cid: str, req: CourseRequest, owner: str = Depends(auth)) ->
 
 @app.post("/courses/{cid}/cloud", status_code=202)
 def course_cloud(cid: str, req: CourseRequest, owner: str = Depends(auth)) -> dict:
-    """يختار سحابة الباقة أو يبدأ الرفع فورًا إن كانت جاهزة."""
+    """يبدأ رفع الباقة إلى السحابة المختارة — برسائل صريحة بدل الصمت (0.9.5)."""
     c = _own_course(cid, owner)
     c.cloud = "telegram" if str(req.cloud).lower() in ("telegram", "tg", "bot") else "mega"
     if req.mega_session:
         c.mega_sid = req.mega_session
     if req.tg_session:
         c.tg_sid = req.tg_session
-    if c.state == "ready" and c.order:
-        _mega_enqueue(c, c.tg_sid if c.cloud == "telegram" else c.mega_sid,
-                      False, auto=False, backend=c.cloud)
-    return {"cloud": c.cloud, "queued": c.state == "ready"}
+    # ① الباقة لازم تكون مغلَّفة وفيه ملفات — بدل ما نرجّع queued:false في صمت
+    if not c.order:
+        if c.state in ("uploading", "fetching"):
+            raise HTTPException(409, "التنزيل على السيرفر لم ينتهِ بعد — انتظر انتهاءه ثم غلّف الباقة.")
+        raise HTTPException(409, "لا ملفات في الباقة — نزّل المحاضرات على السيرفر أولًا (خطوة التنزيل).")
+    if c.state == "packing":
+        raise HTTPException(409, "السيرفر يغلّف الباقة الآن — ثوانٍ ويكون جاهزًا للرفع.")
+    if c.state != "ready":
+        raise HTTPException(409, "الباقة غير جاهزة — غلّفها أولًا (خطوة التسليم).")
+    # ② بيانات السحابة قبل الطابور — الرسالة تقول المطلوب بدقة
+    if c.cloud == "telegram":
+        if not c.tg_sid and not tg_up.enabled():
+            raise HTTPException(400, "لا يوجد بوت تيليجرام مربوط — اربط البوت من الإعدادات ثم أعد المحاولة.")
+        if c.tg_sid and tg_up.session(c.tg_sid) is None and not tg_up.enabled():
+            raise HTTPException(400, "جلسة تيليجرام انتهت — اربط البوت من جديد ثم أعد المحاولة.")
+        sid = c.tg_sid
+    else:
+        if not c.mega_sid and not mega_up.enabled() and not mega_up.FAKE:
+            raise HTTPException(400, "لا توجد بيانات MEGA — سجّل الدخول إلى ميجا مرة واحدة من الإعدادات، أو اضبط MEGA_EMAIL وMEGA_PASSWORD على السيرفر.")
+        if c.mega_sid and mega_up.session(c.mega_sid) is None and not mega_up.enabled() and not mega_up.FAKE:
+            raise HTTPException(400, "جلسة MEGA انتهت — سجّل الدخول إلى ميجا من جديد ثم أعد المحاولة.")
+        sid = c.mega_sid
+    res = _mega_enqueue(c, sid, False, auto=False, backend=c.cloud)
+    return {"cloud": c.cloud, "queued": True, "state": res.get("state"),
+            "position": res.get("position"), "folder": c.name}
 
 
 @app.delete("/courses/{cid}")
 def delete_course(cid: str, owner: str = Depends(auth)) -> dict:
     _own_course(cid, owner)
     return {"deleted": courses.delete(cid)}
+
+
+@app.get("/cloud/status")
+def cloud_status(owner: str = Depends(auth), mega_session: str = "",
+                 tg_session: str = "") -> dict:
+    """حالة جلسات السحابة كما يراها السيرفر — عشان التطبيق يقول للمستخدم الحقيقة قبل الرفع."""
+    m = mega_up.session(mega_session) if mega_session else None
+    t = tg_up.session(tg_session) if tg_session else None
+    tinfo: dict[str, Any] = {}
+    if t is not None:
+        try:
+            tinfo = tg_up.session_info(tg_session) or {}
+        except Exception:
+            tinfo = {}
+    return {
+        "mega": {"session": m is not None, "env": mega_up.enabled(),
+                 "fake": bool(mega_up.FAKE), "email": (m or {}).get("email", "")},
+        "telegram": {"session": t is not None, "env": tg_up.enabled(),
+                     "bot": tinfo.get("bot") or (t or {}).get("bot", ""),
+                     "chat": tinfo.get("chat") or (t or {}).get("chat", "")},
+    }
+
+
+@app.get("/ops")
+def ops_board(owner: str = Depends(auth)) -> dict:
+    """لوحتا العمليات في التطبيق: التنزيلات والرفع داخل استدعاء واحد."""
+    courses_rows: list[dict[str, Any]] = []
+    for c in sorted(courses.COURSES.values(), key=lambda x: x.created_at, reverse=True):
+        if c.owner != owner:
+            continue
+        courses_rows.append({
+            "id": c.id, "name": c.name, "state": c.state, "delivery": c.delivery,
+            "created": c.created_at,
+            "download": {
+                "state": c.fetch_state, "done": c.fetch_done, "total": c.fetch_total,
+                "percent": c.fetch_percent, "current": c.fetch_current,
+                "mux": c.fetch_mux, "muxed": c.fetch_muxed,
+                "errors_count": len(c.fetch_errors),
+                "errors": c.fetch_errors[-5:],
+                "files_done": [{"name": f.name, "size": f.size, "kind": f.kind}
+                               for f in c.files][:60],
+            },
+            "upload": {
+                "backend": c.cloud,
+                "state": c.tg_state if c.cloud == "telegram" else c.mega_state,
+                "percent": c.tg_percent if c.cloud == "telegram" else c.mega_percent,
+                "current": c.tg_current if c.cloud == "telegram" else c.mega_current,
+                "files_done": c.tg_files_done if c.cloud == "telegram" else c.mega_files_done,
+                "files_total": c.tg_files_total if c.cloud == "telegram" else c.mega_files_total,
+                "folder": c.mega_folder or c.name,
+                "sub": c.mega_sub, "folder_link": c.mega_folder_link,
+                "link": (c.mega_link if c.cloud != "telegram" else ""),
+                "messages": len(c.tg_messages),
+                "error": c.tg_error if c.cloud == "telegram" else c.mega_error,
+            },
+            "ready": c.state == "ready", "files": len(c.files),
+        })
+    with MEGA_Q_LOCK:
+        queued = [{"id": it["col"], "backend": it.get("backend") or "mega"} for it in MEGA_Q]
+    return {"courses": courses_rows, "count": len(courses_rows),
+            "queue": queued,
+            "engine": {"current": MEGA_STAT["current"], "name": MEGA_STAT["current_name"],
+                       "processed": MEGA_STAT["processed"], "errors": MEGA_STAT["errors"],
+                       "last_error": MEGA_STAT["last_error"]}}
 
 
 @app.get("/queue")
