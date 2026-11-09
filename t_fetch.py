@@ -191,7 +191,7 @@ def main() -> int:
         assert dl["muxed"] == 2 and dl["errors_count"] == 1, dl
         assert len(dl["files_done"]) >= 4, dl
 
-        print("\nكل اختبارات التنزيل على السيرفر نجحت ✅  (0.9.5 — بلا تنزيل على الهاتف)")
+        print("\nكل اختبارات التنزيل على السيرفر نجحت ✅  (0.9.6 — بلا تنزيل على الهاتف)")
         return 0
     finally:
         api.terminate()

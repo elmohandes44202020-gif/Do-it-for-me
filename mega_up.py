@@ -388,9 +388,25 @@ def mask(email: str) -> str:
 
 
 def create_session(email: str, password: str) -> str:
-    Mega = _import_mega()
-    m = Mega().login(email, password)          # ميجا تُشفّر بيانات الدخول داخليًا
     sid = base64.urlsafe_b64encode(os.urandom(18)).decode().rstrip("=")
+    if FAKE:                                   # وضع الاختبار: جلسة بلا شبكة
+        SESSIONS[sid] = {"client": None, "at": time.time(),
+                         "email": mask(email), "uploads": 0, "fake": True}
+        return sid
+    try:
+        Mega = _import_mega()
+    except Exception as exc:                   # noqa: BLE001
+        raise RuntimeError(
+            "السيرفر يحتاج حزمة mega.py لتسجيل الدخول إلى ميجا — "
+            "ثبّتها بأمر: pip install mega.py") from exc
+    try:
+        m = Mega().login(email, password)      # ميجا تُشفّر بيانات الدخول داخليًا
+    except Exception as exc:                   # noqa: BLE001
+        low = str(exc).lower()
+        if ("password" in low or "credential" in low or "login" in low
+                or "auth" in low or "user" in low or "email" in low):
+            raise RuntimeError("بيانات دخول ميجا غير صحيحة — راجع البريد وكلمة المرور.") from exc
+        raise
     SESSIONS[sid] = {"client": m, "at": time.time(),
                      "email": mask(email), "uploads": 0}
     return sid

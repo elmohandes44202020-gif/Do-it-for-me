@@ -421,7 +421,7 @@ def diag(_owner: str = Depends(auth)) -> dict:
 
     return {
         "ok": True,
-        "version": "0.9.5",
+        "version": "0.9.6",
         "uptime_sec": round(now - STARTED_AT, 1),
         "mega": mega_up.info(),
         "memory": {"rss_mb": rss_mb,
@@ -442,7 +442,7 @@ def healthz() -> dict:
     return {
         "ok": True,
         "service": "notebooklm-mp3",
-        "version": "0.9.5",
+        "version": "0.9.6",
         "python": sys.version.split()[0],
         "pyav": getattr(_av, "__version__", "?"),
         "jobs": len(JOBS),
@@ -543,7 +543,7 @@ def diagnose(req: DiagnoseRequest, owner: str = Depends(auth)) -> dict:
         "referer_sent": bool(req.referer),
         "server": {
             "service": "notebooklm-mp3",
-            "version": "0.9.5",
+            "version": "0.9.6",
             "python": sys.version.split()[0],
             "platform": platform.platform(),
             "pyav": getattr(_av, "__version__", "?"),
@@ -1755,7 +1755,7 @@ def course_file(cid: str, idx: int, t: str | None = None,
     else:
         c = _own_course(cid, auth(x_api_key))
     row = next((e for e in c.order if int(e.get("order") or 0) == idx), None)
-    if row is None:                        # 0.9.5: قبل التغليف نخدم الملف بالمسودة
+    if row is None:                        # 0.9.6: قبل التغليف نخدم الملف بالمسودة
         f0 = next((f for f in c.files if int(f.idx) == idx), None)
         if f0 is not None:
             row = {"name": f0.name, "path": f0.path, "size": f0.size}
@@ -1792,7 +1792,7 @@ class FetchRequest(BaseModel):
 
 @app.post("/courses/{cid}/fetch", status_code=202)
 def fetch_course(cid: str, req: FetchRequest, owner: str = Depends(auth)) -> dict:
-    """0.9.5: السيرفر هو من ينزّل الفيديوهات والترجمات — لا تنزيل على الهاتف."""
+    """0.9.6: السيرفر هو من ينزّل الفيديوهات والترجمات — لا تنزيل على الهاتف."""
     c = _own_course(cid, owner)
     if c.state in ("packing", "ready"):
         raise HTTPException(409, "الباقة مقفلة — ابدأ باقة جديدة")
@@ -1815,7 +1815,7 @@ def course_delivery(cid: str, req: CourseRequest, owner: str = Depends(auth)) ->
 
 @app.post("/courses/{cid}/cloud", status_code=202)
 def course_cloud(cid: str, req: CourseRequest, owner: str = Depends(auth)) -> dict:
-    """يبدأ رفع الباقة إلى السحابة المختارة — برسائل صريحة بدل الصمت (0.9.5)."""
+    """يبدأ رفع الباقة إلى السحابة المختارة — برسائل صريحة بدل الصمت (0.9.6)."""
     c = _own_course(cid, owner)
     c.cloud = "telegram" if str(req.cloud).lower() in ("telegram", "tg", "bot") else "mega"
     if req.mega_session:

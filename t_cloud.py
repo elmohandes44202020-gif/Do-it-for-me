@@ -128,7 +128,7 @@ def main() -> int:
         print(f"✓ لوحة التنزيل: «{row2['name']}» → {row2['download']['state']}"
               f" {row2['download']['done']}/{row2['download']['total']}")
 
-        print("\nكل اختبارات الرفع من السيرفر ولوحات العمليات نجحت ✅  (0.9.5)")
+        print("\nكل اختبارات الرفع من السيرفر ولوحات العمليات نجحت ✅  (0.9.6)")
         return 0
     finally:
         api.terminate()
