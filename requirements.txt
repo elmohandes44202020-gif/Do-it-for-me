@@ -2,6 +2,7 @@ fastapi
 uvicorn[standard]
 httpx
 av
+imageio-ffmpeg
 pydantic>=2
 python-multipart
 pycryptodome>=3.19

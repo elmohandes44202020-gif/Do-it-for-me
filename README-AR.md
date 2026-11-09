@@ -292,6 +292,29 @@ POST /links/file   multipart: file=links.txt + meta={}
 
 ---
 
+## 0.9.4 — التنزيل على السيرفر (لا تنزيل على الهاتف)
+
+بدل ما التطبيق ينزّل الفيديوهات على الهاتف ثم يرفعها، بقى الهاتف يبعت **روابط** المحاضرات
+والترجمة للسيرفر، والسيرفر هو اللي ينزّل ويحوّل ويَدمج ويغلّف ويرفع.
+
+| المسار | ماذا يفعل |
+|---|---|
+| `POST /courses` | يفتح باقة جديدة (state=`uploading`) — كما كان |
+| `POST /courses/{cid}/fetch` | 202 — يبدأ التنزيل على السيرفر من قائمة عناصر `{name,kind,url,subtitle{url,format}}` + `cookie` + `user_agent` + `embed` |
+| `GET /courses/{cid}` | `fetch:{state,done,total,percent,current,mux,muxed,errors[],errors_count}` + `files[]` بترتيب الوصول |
+| `POST /courses/{cid}/delivery` | `{"delivery":"zip|folder"}` قبل التغليف فقط (409 بعدها) |
+| `POST /courses/{cid}/finalize` | يغلّف (ZIP أو مجلد) ثم يرفع MEGA/Telegram كما كان |
+| `POST /courses/{cid}/cloud` | يختار السحابة ويبدأ الرفع لو الباقة جاهزة |
+
+- الترجمة: VTT ⇒ SRT عربي، والدمج داخل MP4 بخيار `mov_text` (**ffmpeg خارجي**؛ لا PyAV للترجمة).
+  ffmpeg يُبحث في PATH ثم في حزمة `imageio-ffmpeg` — أضفناها إلى `requirements.txt`.
+- كل محاضرة تُنتج ملفين: `الاسم.mp4` (مدموج) + `الاسم.ar.srt`، والترقيم النهائي `001 - الاسم` يحدث وقت التغليف.
+- فشل ملف واحد لا يُسقط الباقة: يظهر في `fetch.errors` ويتكمل الباقي.
+- حماية SSRF: `http` مرفوض افتراضيًا، والعناوين الخاصة/المحلية مرفوضة إلا مع `COURSE_FETCH_ALLOW_LOCAL=1`.
+- سقف الحجم `COURSE_FETCH_MAX_MB` (افتراضي 4096)، والملفات المؤقتة تُمسح بعد الدمج.
+
+اختبار سريع: `python3 t_fetch.py` ⇒ «كل اختبارات التنزيل على السيرفر نجحت ✅».
+
 ## 0.9.3 — تصحيح معرّف محادثة تيليجرام ورسائل عربية نظيفة
 
 **المشكلة:** `Forbidden: the bot can't send messages to the bot` — كان السيرفر يقبل معرّف

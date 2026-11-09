@@ -89,6 +89,15 @@ class Course:
     tg_seconds: float = 0.0
     tg_bot: str = ""
     tg_messages: list[dict] = field(default_factory=list)
+    # 0.9.4: تنزيل على السيرفر (لا تنزيل محلي على الهاتف)
+    fetch_state: str = "idle"        # idle | fetching | done | error
+    fetch_done: int = 0
+    fetch_total: int = 0
+    fetch_percent: int = 0
+    fetch_current: str = ""
+    fetch_errors: list[dict] = field(default_factory=list)
+    fetch_mux: str = ""              # ffmpeg | off
+    fetch_muxed: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @property
@@ -137,6 +146,12 @@ class Course:
                    "files_total": self.tg_files_total, "current": self.tg_current,
                    "bot": self.tg_bot,
                    "messages": len(self.tg_messages)},
+            "fetch": {"state": self.fetch_state, "done": self.fetch_done,
+                      "total": self.fetch_total, "percent": self.fetch_percent,
+                      "current": self.fetch_current, "mux": self.fetch_mux,
+                      "muxed": self.fetch_muxed,
+                      "errors": self.fetch_errors[-10:],
+                      "errors_count": len(self.fetch_errors)},
             "notes": self.notes[-20:],
         }
         if self.state == "ready" and base:
@@ -195,6 +210,35 @@ def commit(course: Course, slot: dict, size: int) -> dict:
                                    path=slot["path"], kind=slot.get("kind") or "other"))
     course.note(f"⬆ استلمت «{slot['name']}» ({size/1048576:.1f} م.ب)")
     return {"idx": slot["idx"], "name": slot["name"], "size": size}
+
+
+def attach(course: "Course", path: str, name: str, kind: str = "other") -> dict:
+    """يُسجّل ملفًا نزل على السيرفر داخل الباقة (بترتيب الوصول)."""
+    if not path or not os.path.exists(path):
+        raise RuntimeError("الملف غير موجود على السيرفر")
+    size = os.path.getsize(path)
+    if size <= 0:
+        raise RuntimeError("ملف فارغ")
+    if len(course.files) >= MAX_FILES:
+        raise RuntimeError(f"الحد الأقصى {MAX_FILES} ملفًا في الباقة")
+    clean = safe_name(name, "file")
+    idx = len(course.files) + 1
+    os.makedirs(course.files_dir, exist_ok=True)
+    dest = os.path.join(course.files_dir, f"{idx:03d}-{clean}")
+    shutil.move(path, dest)
+    course.files.append(CourseFile(idx=idx, name=clean, size=size, path=dest, kind=kind))
+    course.note(f"📥 أضفت «{clean}» ({size/1048576:.1f} م.ب) من تنزيل السيرفر")
+    return {"idx": idx, "name": clean, "size": size}
+
+
+def set_delivery(course: "Course", delivery: str) -> str:
+    """يغيّر طريقة التسليم قبل التغليف فقط (zip | folder)."""
+    with course._lock:
+        if course.state in ("packing", "ready"):
+            return course.delivery
+        course.delivery = "folder" if str(delivery).lower() in ("folder", "dir") else "zip"
+    course.note(f"📦 طريقة التسليم: {'مجلد' if course.delivery == 'folder' else 'ZIP'}")
+    return course.delivery
 
 
 def finalize(course: Course) -> bool:

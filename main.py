@@ -42,6 +42,7 @@ import av as _av
 import mega_up
 import tg_up
 import courses
+import course_fetch
 import notecol as colls
 import links
 import media
@@ -420,7 +421,7 @@ def diag(_owner: str = Depends(auth)) -> dict:
 
     return {
         "ok": True,
-        "version": "0.9.3",
+        "version": "0.9.4",
         "uptime_sec": round(now - STARTED_AT, 1),
         "mega": mega_up.info(),
         "memory": {"rss_mb": rss_mb,
@@ -441,7 +442,7 @@ def healthz() -> dict:
     return {
         "ok": True,
         "service": "notebooklm-mp3",
-        "version": "0.9.3",
+        "version": "0.9.4",
         "python": sys.version.split()[0],
         "pyav": getattr(_av, "__version__", "?"),
         "jobs": len(JOBS),
@@ -542,7 +543,7 @@ def diagnose(req: DiagnoseRequest, owner: str = Depends(auth)) -> dict:
         "referer_sent": bool(req.referer),
         "server": {
             "service": "notebooklm-mp3",
-            "version": "0.9.3",
+            "version": "0.9.4",
             "python": sys.version.split()[0],
             "platform": platform.platform(),
             "pyav": getattr(_av, "__version__", "?"),
@@ -1754,6 +1755,10 @@ def course_file(cid: str, idx: int, t: str | None = None,
     else:
         c = _own_course(cid, auth(x_api_key))
     row = next((e for e in c.order if int(e.get("order") or 0) == idx), None)
+    if row is None:                        # 0.9.4: قبل التغليف نخدم الملف بالمسودة
+        f0 = next((f for f in c.files if int(f.idx) == idx), None)
+        if f0 is not None:
+            row = {"name": f0.name, "path": f0.path, "size": f0.size}
     if not row or not os.path.exists(row["path"]):
         raise HTTPException(404, "الملف غير موجود")
     headers = {"Content-Disposition": cd_header(row["name"]),
@@ -1769,6 +1774,43 @@ def course_file(cid: str, idx: int, t: str | None = None,
 
     mime = "video/mp4" if str(row.get("name", "")).endswith(".mp4") else "application/octet-stream"
     return StreamingResponse(stream(), media_type=mime, headers=headers)
+
+
+class FetchItem(BaseModel):
+    name: str = "file"
+    url: str = ""
+    kind: str = "video"            # video | srt | txt | other
+    subtitle: dict | None = None   # {"url": "...", "format": "vtt|srt"}
+
+
+class FetchRequest(BaseModel):
+    items: list[FetchItem] = []
+    cookie: str = ""
+    user_agent: str = ""
+    embed: bool = True
+
+
+@app.post("/courses/{cid}/fetch", status_code=202)
+def fetch_course(cid: str, req: FetchRequest, owner: str = Depends(auth)) -> dict:
+    """0.9.4: السيرفر هو من ينزّل الفيديوهات والترجمات — لا تنزيل على الهاتف."""
+    c = _own_course(cid, owner)
+    if c.state in ("packing", "ready"):
+        raise HTTPException(409, "الباقة مقفلة — ابدأ باقة جديدة")
+    if c.fetch_state == "fetching":
+        raise HTTPException(409, "التنزيل على السيرفر يعمل بالفعل")
+    items = [i.dict() if hasattr(i, "dict") else i.model_dump() for i in req.items]
+    if not items:
+        raise HTTPException(400, "لا عناصر للتنزيل")
+    course_fetch.start(c, items, req.cookie, req.user_agent, req.embed)
+    return {"state": "fetching", "count": len(items), "embed": req.embed,
+            "mux": "ffmpeg" if course_fetch.ffmpeg_bin() else "off"}
+
+
+@app.post("/courses/{cid}/delivery")
+def course_delivery(cid: str, req: CourseRequest, owner: str = Depends(auth)) -> dict:
+    """يختار ZIP أو مجلد قبل التغليف (خطوة التسليم)."""
+    c = _own_course(cid, owner)
+    return {"delivery": courses.set_delivery(c, req.delivery), "state": c.state}
 
 
 @app.post("/courses/{cid}/cloud", status_code=202)
