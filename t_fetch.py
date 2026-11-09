@@ -93,7 +93,7 @@ def main() -> int:
         print("· إصدار السيرفر:", httpx.get(base + "/healthz").json()["version"])
 
         cid = httpx.post(base + "/courses", headers=H, json={
-            "name": "دورة التنزيل على السيرفر", "delivery": "zip",
+            "name": "دورة الأربع وحدات", "delivery": "zip",
             "cloud": "mega", "auto": True}, timeout=30).json()["course_id"]
         print("✓ باقة جديدة:", cid)
 
@@ -101,12 +101,15 @@ def main() -> int:
             "cookie": "CAUTH=abc; other=1",
             "user_agent": "NoteWorm-Test",
             "embed": True,
+            "text": True,                      # 0.9.8: ملف .ar.txt نصي لكل محاضرة
             "items": [
-                {"name": "مقدمة.mp4", "kind": "video", "url": f"{files}/lecture.mp4",
+                {"name": "الوحدة 1 - مقدمة.mp4", "kind": "video", "url": f"{files}/lecture.mp4",
                  "subtitle": {"url": f"{files}/lecture.vtt", "format": "vtt"}},
-                {"name": "الانحدار.mp4", "kind": "video", "url": f"{files}/lecture.mp4",
+                {"name": "الوحدة 2 - الانحدار.mp4", "kind": "video", "url": f"{files}/lecture.mp4",
                  "subtitle": {"url": f"{files}/lecture.vtt", "format": "vtt"}},
-                {"name": "محذوف.mp4", "kind": "video", "url": f"{files}/missing.mp4"},
+                {"name": "الوحدة 3 - التصنيف.mp4", "kind": "video", "url": f"{files}/lecture.mp4",
+                 "subtitle": {"url": f"{files}/lecture.vtt", "format": "vtt"}},
+                {"name": "الوحدة 4 - محذوف.mp4", "kind": "video", "url": f"{files}/missing.mp4"},
             ]})
         assert r.status_code == 202, r.text
         print("✓ بدأ التنزيل على السيرفر:", r.json())
@@ -125,11 +128,15 @@ def main() -> int:
         if fetch["errors"]:
             print("· أخطاء الملفات:", fetch["errors"])
         assert fetch["state"] in ("done", "error")
-        assert fetch["done"] == 3, fetch
-        assert len(st["files"]) == 4, st["files"]          # فيديوان + ترجمتان
+        assert fetch["done"] == 4, fetch
         names = [f["name"] for f in st["files"]]
-        assert names[0] == "مقدمة.mp4" and names[1] == "مقدمة.ar.srt", names
-        assert names[2] == "الانحدار.mp4" and names[3] == "الانحدار.ar.srt", names
+        # أربع وحدات: لكل محاضرة MP4 مدموج + SRT + TXT ⇒ 3 ملفات × 3 محاضرات ناجحة
+        assert len(st["files"]) == 9, names
+        assert names[0] == "الوحدة 1 - مقدمة.mp4", names
+        assert names[1] == "الوحدة 1 - مقدمة.ar.srt", names
+        assert names[2] == "الوحدة 1 - مقدمة.ar.txt", names
+        assert names[3] == "الوحدة 2 - الانحدار.mp4", names
+        assert fetch["muxed"] == 3, fetch
         assert len(fetch["errors"]) == 1, fetch["errors"]
         assert "محذوف" in fetch["errors"][0]["name"]
 
@@ -140,6 +147,14 @@ def main() -> int:
         assert "-->" in text and "مقدمة الدرس" in text, text[:200]
         assert "," in text.split("-->")[0], "SRT يجب أن يستخدم الفاصلة"
         print("✓ ملف SRT عربي سليم (VTT ⇒ SRT):", text.splitlines()[1])
+
+        # الملف النصي: عربي بلا توقيتات ولا أرقام أسطر
+        txt = httpx.get(base + f"/courses/{cid}/file/3", headers=H, timeout=60)
+        assert txt.status_code == 200, txt.status_code
+        body = txt.content.decode("utf-8")
+        print("✓ ملف نصي .ar.txt:", repr(body[:60]))
+        assert "مقدمة الدرس" in body, body[:200]
+        assert "-->" not in body and not any(l.strip().isdigit() for l in body.splitlines())
 
         # هل دُمجت الترجمة فعلًا داخل MP4؟
         blob = httpx.get(base + f"/courses/{cid}/file/1", headers=H, timeout=120).content
@@ -178,8 +193,11 @@ def main() -> int:
             z = zipfile.ZipFile(_io.BytesIO(b"".join(resp.iter_bytes())))
         inside = sorted(z.namelist())
         print("✓ داخل الـZIP:", inside)
-        assert inside == ["001 - مقدمة.mp4", "002 - مقدمة.ar.srt",
-                          "003 - الانحدار.mp4", "004 - الانحدار.ar.srt"], inside
+        assert inside == ["001 - الوحدة 1 - مقدمة.mp4", "002 - الوحدة 1 - مقدمة.ar.srt",
+                          "003 - الوحدة 1 - مقدمة.ar.txt", "004 - الوحدة 2 - الانحدار.mp4",
+                          "005 - الوحدة 2 - الانحدار.ar.srt", "006 - الوحدة 2 - الانحدار.ar.txt",
+                          "007 - الوحدة 3 - التصنيف.mp4", "008 - الوحدة 3 - التصنيف.ar.srt",
+                          "009 - الوحدة 3 - التصنيف.ar.txt"], inside
 
         # لوحة العمليات: صف التنزيل يعرض ما نُزّل فعلًا
         ops = httpx.get(base + "/ops", headers=H, timeout=30).json()
@@ -187,11 +205,11 @@ def main() -> int:
         dl = row["download"]
         print(f"· /ops (تنزيل): «{row['name']}» {dl['state']} {dl['done']}/{dl['total']}"
               f" · مدموج {dl['muxed']} · أخطاء {dl['errors_count']} · ملفات {len(dl['files_done'])}")
-        assert dl["state"] == "done" and dl["done"] == 3, dl
-        assert dl["muxed"] == 2 and dl["errors_count"] == 1, dl
-        assert len(dl["files_done"]) >= 4, dl
+        assert dl["state"] == "done" and dl["done"] == 4, dl
+        assert dl["muxed"] == 3 and dl["errors_count"] == 1, dl
+        assert len(dl["files_done"]) >= 9, dl
 
-        print("\nكل اختبارات التنزيل على السيرفر نجحت ✅  (0.9.6 — بلا تنزيل على الهاتف)")
+        print("\nكل اختبارات التنزيل على السيرفر نجحت ✅  (0.9.8 — بلا تنزيل على الهاتف)")
         return 0
     finally:
         api.terminate()

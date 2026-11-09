@@ -354,12 +354,32 @@ def _janitor_loop() -> None:
                 shutil.rmtree(os.path.join(WORK_DIR, j.id), ignore_errors=True)
 
 
+def _cleanup_transient() -> None:
+    """0.9.9: لا نمسح مجلد الباقات (courses) — الطابور يعيش عبر إعادة التشغيل.
+
+    نمسح فقط بقايا المجموعات المؤقتة (وضع نوتبوك) التي لا تُستأنف.
+    """
+    try:
+        for name in os.listdir(WORK_DIR):
+            if name == "courses":
+                continue
+            shutil.rmtree(os.path.join(WORK_DIR, name), ignore_errors=True)
+    except Exception:
+        pass
+
+
 @app.on_event("startup")
 def _startup() -> None:
-    shutil.rmtree(WORK_DIR, ignore_errors=True)   # لا بقايا من تشغيل سابق
     os.makedirs(WORK_DIR, exist_ok=True)
+    os.makedirs(courses.base_dir(), exist_ok=True)
+    _cleanup_transient()
     colls.ON_READY = _auto_mega          # الرفع التلقائي إلى MEGA
     courses.ON_READY = _auto_mega        # باقات كورسيرا تستخدم نفس المحرّك
+    restored = courses.load()            # 0.9.9: باقات التشغيل السابق
+    resumed = _restore_queue()           # 0.9.9: إعادة ترتيب طابور الرفع
+    if restored or resumed:
+        print(f"[startup] باقات مستعادة: {restored} · عمليات رفع أُعيد ترتيبها: {resumed}",
+              flush=True)
     threading.Thread(target=_worker_loop, daemon=True, name="nlm-worker").start()
     threading.Thread(target=_mega_engine, daemon=True, name="nlm-mega-engine").start()
     threading.Thread(target=_janitor_loop, daemon=True, name="nlm-janitor").start()
@@ -421,7 +441,7 @@ def diag(_owner: str = Depends(auth)) -> dict:
 
     return {
         "ok": True,
-        "version": "0.9.7",
+        "version": "0.9.9",
         "uptime_sec": round(now - STARTED_AT, 1),
         "mega": mega_up.info(),
         "memory": {"rss_mb": rss_mb,
@@ -442,7 +462,7 @@ def healthz() -> dict:
     return {
         "ok": True,
         "service": "notebooklm-mp3",
-        "version": "0.9.7",
+        "version": "0.9.9",
         "python": sys.version.split()[0],
         "pyav": getattr(_av, "__version__", "?"),
         "jobs": len(JOBS),
@@ -543,7 +563,7 @@ def diagnose(req: DiagnoseRequest, owner: str = Depends(auth)) -> dict:
         "referer_sent": bool(req.referer),
         "server": {
             "service": "notebooklm-mp3",
-            "version": "0.9.7",
+            "version": "0.9.9",
             "python": sys.version.split()[0],
             "platform": platform.platform(),
             "pyav": getattr(_av, "__version__", "?"),
@@ -1142,8 +1162,13 @@ def mega_open_session(req: MegaSessionReq, owner: str = Depends(auth)) -> dict:
         del password
         raise HTTPException(status_code=401, detail=msg[:200])
     del password                              # لا نُبقي كلمة المرور في أي مرجع
+    try:
+        resumed = _resume_for_session(owner, "mega")
+    except Exception:
+        resumed = 0
     return {"session_id": sid, "email": mega_up.mask(email),
             "expires_in_sec": mega_up.SESS_TTL,
+            "resumed": resumed,
             "note": "البيانات لم تُخزَّن على السيرفر — الجلسة فقط"}
 
 
@@ -1186,6 +1211,11 @@ def _mega_enqueue(col: "colls.Collection", sid: str, wipe: bool = False,
             col.mega_percent = 0
         col.mega_files_done = 0
         col.mega_files_total = len(col.order)
+        try:
+            if not getattr(col, "queued_at", 0.0):   # 0.9.9: ترتيب ثابت للطابور
+                col.queued_at = time.time()
+        except Exception:
+            pass
         col.note(("☁️ رفع تلقائي إلى MEGA — في الطابور…" if auto
                   else "☁️ في طابور الرفع إلى MEGA…"))
         if backend != "telegram":
@@ -1193,6 +1223,10 @@ def _mega_enqueue(col: "colls.Collection", sid: str, wipe: bool = False,
         MEGA_Q.append({"col": col.id, "sid": sid, "wipe": wipe, "auto": auto,
                        "backend": backend, "at": time.time()})
         pos = len(MEGA_Q)
+    try:
+        courses.save()
+    except Exception:
+        pass
     MEGA_WAKE.set()
     return {"state": "queued", "position": pos}
 
@@ -1200,6 +1234,16 @@ def _mega_enqueue(col: "colls.Collection", sid: str, wipe: bool = False,
 def _mega_run(col: "colls.Collection", sid: str, wipe: bool = False) -> None:
     """ينفّذ الرفع فعليًا (كان داخل خيط مستقل — الآن داخل المحرّك المتوالٍ)."""
     sess = mega_up.session(sid) if sid else None
+    if sess is None and not mega_up.enabled() and not mega_up.FAKE:
+        # 0.9.9: الطابور ينتظر جلسة بدل ما يفشل — ويُستأنف تلقائيًا بعد الدخول
+        col.mega_state = "needs_session"
+        col.mega_error = "الرفع في الانتظار: سجّل الدخول إلى MEGA ليبدأ تلقائيًا."
+        col.note("⏸ الرفع في الطابور بانتظار جلسة MEGA")
+        try:
+            courses.save()
+        except Exception:
+            pass
+        return
     zip_path = os.path.join(col.dir, "_mega_upload.zip")
     remote = (col.name or "notebooklm-audio") + ".zip"
     col.mega_state = "uploading"
@@ -1315,9 +1359,13 @@ def _tg_run(col: "colls.Collection", sid: str) -> None:
     token = (sess or {}).get("token") or tg_up.TOKEN_ENV
     chat = (sess or {}).get("chat") or tg_up.CHAT_ENV
     if not token or not chat:
-        col.tg_state = "error"
-        col.tg_error = "لا جلسة تيليجرام صالحة — اربط البوت من التطبيق أولًا"
-        col.note("❌ " + col.tg_error)
+        col.tg_state = "needs_session"
+        col.tg_error = "الإرسال في الانتظار: اربط بوت تيليجرام ليبدأ تلقائيًا."
+        col.note("⏸ الإرسال في الطابور بانتظار جلسة تيليجرام")
+        try:
+            courses.save()
+        except Exception:
+            pass
         return
     # 0.9.3: معرّف المحادثة قد يكون البوت نفسه (سبب «the bot can't send messages
     # to the bot») ⇒ نصحّحه تلقائيًا بدل إفشال الرفع، ونخبر المستخدم بجملة واحدة.
@@ -1393,12 +1441,79 @@ def _tg_run(col: "colls.Collection", sid: str) -> None:
             pass
 
 
+PAUSE_UPLOADS = (os.environ.get("NW_PAUSE_UPLOADS") or "").strip() in ("1", "true", "yes")
+
+
+def _upload_state(col: Any) -> str:
+    return col.tg_state if getattr(col, "cloud", "mega") == "telegram" else col.mega_state
+
+
+def _restore_queue() -> int:
+    """يعيد ترتيب كل رفع لم يكتمل (بعد إعادة تشغيل السيرفر) بترتيب دخوله الأصلي."""
+    pending: list[Any] = []
+    for c in list(courses.COURSES.values()):
+        if c.state != "ready" or not c.order:
+            continue
+        st = _upload_state(c)
+        if st in ("done", "uploading", "link"):
+            continue
+        if st == "error" and not getattr(c, "queued_at", 0.0):
+            continue
+        if st in ("queued", "error", "needs_session") or (
+                st == "idle" and getattr(c, "auto_mega", False)):
+            pending.append(c)
+    pending.sort(key=lambda c: (getattr(c, "queued_at", 0.0) or c.created_at))
+    count = 0
+    for c in pending:
+        backend = getattr(c, "cloud", "mega")
+        sid = c.tg_sid if backend == "telegram" else c.mega_sid
+        if backend == "telegram":
+            c.tg_state, c.tg_error, c.tg_percent = "idle", "", 0
+        else:
+            c.mega_state, c.mega_error, c.mega_percent = "idle", "", 0
+        c.note("🔁 استئناف الرفع بعد إعادة تشغيل السيرفر")
+        _mega_enqueue(c, sid or "", False, auto=True, backend=backend)
+        count += 1
+    if count:
+        try:
+            courses.save()
+        except Exception:
+            pass
+    return count
+
+
+def _resume_for_session(owner: str, backend: str) -> int:
+    """بعد تسجيل دخول جديد: أعد ترتيب الرفع الذي كان واقفًا بانتظار جلسة."""
+    count = 0
+    for c in list(courses.COURSES.values()):
+        if c.owner != owner or getattr(c, "cloud", "mega") != backend:
+            continue
+        if _upload_state(c) != "needs_session":
+            continue
+        if c.state != "ready" or not c.order:
+            continue
+        sid = c.tg_sid if backend == "telegram" else c.mega_sid
+        c.note("🔓 عادت الجلسة — يُستأنف الرفع تلقائيًا")
+        _mega_enqueue(c, sid or "", False, auto=True, backend=backend)
+        count += 1
+    if count:
+        try:
+            courses.save()
+        except Exception:
+            pass
+    return count
+
+
 def _mega_engine() -> None:
     """خيط واحد: مجموعة واحدة ترفع في أي لحظة ⇒ لا تعارض ولا تزامن."""
     while True:
         MEGA_WAKE.wait(1.0)
         MEGA_WAKE.clear()
         while True:
+            if PAUSE_UPLOADS:                 # للاختبار فقط
+                time.sleep(0.4)
+                MEGA_WAKE.set()
+                break
             with MEGA_Q_LOCK:
                 if not MEGA_Q:
                     MEGA_STAT["current"] = ""
@@ -1430,6 +1545,10 @@ def _mega_engine() -> None:
                 MEGA_STAT["current_name"] = ""
 
 
+                try:
+                    courses.save()             # 0.9.9: تثبيت حالة الطابور على القرص
+                except Exception:
+                    pass
 def _auto_mega(col: "colls.Collection") -> None:
     """يُنادى تلقائيًا عند جاهزية المجموعة — يرفع إلى السحابة المختارة بلا تطبيق."""
     if not getattr(col, "auto_mega", False):
@@ -1512,7 +1631,11 @@ def tg_open_session(req: MegaSessionReq, owner: str = Depends(auth)) -> dict:
         raise HTTPException(400, f"{e}")
     s0 = tg_up.session(sid) or {}
     real_chat = s0.get("chat") or chat
-    return {"session_id": sid, "bot": s0.get("bot", ""), "chat": real_chat,
+    try:
+        resumed = _resume_for_session(owner, "telegram")
+    except Exception:
+        resumed = 0
+    return {"session_id": sid, "bot": s0.get("bot", ""), "chat": real_chat, "resumed": resumed,
             "chat_fixed": real_chat != chat, "note": s0.get("note", ""),
             "chat_type": (s0.get("chat_info") or {}).get("type", ""),
             "max_mb": tg_up.MAX_MB,
@@ -1764,7 +1887,7 @@ def course_file(cid: str, idx: int, t: str | None = None,
     else:
         c = _own_course(cid, auth(x_api_key))
     row = next((e for e in c.order if int(e.get("order") or 0) == idx), None)
-    if row is None:                        # 0.9.7: قبل التغليف نخدم الملف بالمسودة
+    if row is None:                        # 0.9.9: قبل التغليف نخدم الملف بالمسودة
         f0 = next((f for f in c.files if int(f.idx) == idx), None)
         if f0 is not None:
             row = {"name": f0.name, "path": f0.path, "size": f0.size}
@@ -1794,6 +1917,7 @@ class FetchItem(BaseModel):
 
 class FetchRequest(BaseModel):
     items: list[FetchItem] = []
+    text: bool = False                 # 0.9.9: ملف .ar.txt نصي لكل محاضرة
     cookie: str = ""
     user_agent: str = ""
     embed: bool = True
@@ -1801,7 +1925,7 @@ class FetchRequest(BaseModel):
 
 @app.post("/courses/{cid}/fetch", status_code=202)
 def fetch_course(cid: str, req: FetchRequest, owner: str = Depends(auth)) -> dict:
-    """0.9.7: السيرفر هو من ينزّل الفيديوهات والترجمات — لا تنزيل على الهاتف."""
+    """0.9.9: السيرفر هو من ينزّل الفيديوهات والترجمات — لا تنزيل على الهاتف."""
     c = _own_course(cid, owner)
     if c.state in ("packing", "ready"):
         raise HTTPException(409, "الباقة مقفلة — ابدأ باقة جديدة")
@@ -1810,7 +1934,7 @@ def fetch_course(cid: str, req: FetchRequest, owner: str = Depends(auth)) -> dic
     items = [i.dict() if hasattr(i, "dict") else i.model_dump() for i in req.items]
     if not items:
         raise HTTPException(400, "لا عناصر للتنزيل")
-    course_fetch.start(c, items, req.cookie, req.user_agent, req.embed)
+    course_fetch.start(c, items, req.cookie, req.user_agent, req.embed, req.text)
     return {"state": "fetching", "count": len(items), "embed": req.embed,
             "mux": "ffmpeg" if course_fetch.ffmpeg_bin() else "off"}
 
@@ -1824,7 +1948,7 @@ def course_delivery(cid: str, req: CourseRequest, owner: str = Depends(auth)) ->
 
 @app.post("/courses/{cid}/cloud", status_code=202)
 def course_cloud(cid: str, req: CourseRequest, owner: str = Depends(auth)) -> dict:
-    """يبدأ رفع الباقة إلى السحابة المختارة — برسائل صريحة بدل الصمت (0.9.7)."""
+    """يبدأ رفع الباقة إلى السحابة المختارة — برسائل صريحة بدل الصمت (0.9.9)."""
     c = _own_course(cid, owner)
     c.cloud = "telegram" if str(req.cloud).lower() in ("telegram", "tg", "bot") else "mega"
     if req.mega_session:
@@ -1885,6 +2009,18 @@ def cloud_status(owner: str = Depends(auth), mega_session: str = "",
     }
 
 
+def _mega_pos(col_id: str) -> int:
+    """موضع الباقة في طابور الرفع (0 = ليست في الطابور)."""
+    try:
+        with MEGA_Q_LOCK:
+            for i, it in enumerate(MEGA_Q, start=1):
+                if it["col"] == col_id:
+                    return i
+    except Exception:
+        pass
+    return 0
+
+
 @app.get("/ops")
 def ops_board(owner: str = Depends(auth)) -> dict:
     """لوحتا العمليات في التطبيق: التنزيلات والرفع داخل استدعاء واحد."""
@@ -1905,6 +2041,8 @@ def ops_board(owner: str = Depends(auth)) -> dict:
                                for f in c.files][:60],
             },
             "upload": {
+                "position": _mega_pos(c.id),
+                "queued_at": getattr(c, "queued_at", 0.0),
                 "backend": c.cloud,
                 "state": c.tg_state if c.cloud == "telegram" else c.mega_state,
                 "percent": c.tg_percent if c.cloud == "telegram" else c.mega_percent,
@@ -1926,6 +2064,22 @@ def ops_board(owner: str = Depends(auth)) -> dict:
             "engine": {"current": MEGA_STAT["current"], "name": MEGA_STAT["current_name"],
                        "processed": MEGA_STAT["processed"], "errors": MEGA_STAT["errors"],
                        "last_error": MEGA_STAT["last_error"]}}
+
+
+@app.post("/queue/prioritize")
+def queue_prioritize(req: dict, owner: str = Depends(auth)) -> dict:
+    """يقدّم باقة إلى مقدمة الطابور (ترتيب التنفيذ)."""
+    cid = str(req.get("course_id") or req.get("id") or "")
+    _own_course(cid, owner)
+    with MEGA_Q_LOCK:
+        idx = next((i for i, it in enumerate(MEGA_Q) if it["col"] == cid), -1)
+        if idx < 0:
+            raise HTTPException(409, "هذه الباقة ليست في الطابور الآن.")
+        if idx:
+            MEGA_Q.insert(0, MEGA_Q.pop(idx))
+        order = [it["col"] for it in MEGA_Q]
+    MEGA_WAKE.set()
+    return {"queue": order, "position": 1}
 
 
 @app.get("/queue")
@@ -1956,7 +2110,9 @@ def global_queue(owner: str = Depends(auth)) -> dict:
             errors = sum(1 for i in c.items if i.state == "error")
         phase = base_state
         if base_state == "done":
-            if st_cloud in ("queued", "uploading", "link", "done", "error"):
+            if st_cloud == "needs_session":
+                phase = "waiting_session"
+            elif st_cloud in ("queued", "uploading", "link", "done", "error"):
                 phase = ("uploading" if st_cloud in ("uploading", "link")
                          else ("uploaded" if st_cloud == "done"
                                else ("upload_error" if st_cloud == "error" else "upload_queued")))
@@ -1979,6 +2135,7 @@ def global_queue(owner: str = Depends(auth)) -> dict:
             "mega_current": c.mega_current, "mega_error": c.mega_error,
             "link": c.mega_link, "folder_link": c.mega_folder_link,
             "created": c.created_at,
+            "queued_at": getattr(c, "queued_at", 0.0),
         })
     busy = sum(1 for i in items if i["phase"] in ("processing", "sorting", "uploading"))
     return {

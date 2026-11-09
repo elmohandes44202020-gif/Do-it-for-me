@@ -59,6 +59,7 @@ class Course:
     error: str = ""
     order: list[dict] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
+    queued_at: float = 0.0        # 0.9.9: وقت دخول الطابور (يحفظ الترتيب بعد إعادة التشغيل)
     ready_at: float | None = None
     notes: list[str] = field(default_factory=list)
     zip_path: str = ""
@@ -162,6 +163,99 @@ class Course:
         return out
 
 
+SAVE_SKIP = {"files", "order", "notes", "_lock", "zip_path"}
+
+
+def state_path() -> str:
+    return os.path.join(base_dir(), "courses.json")
+
+
+def _dump(c: "Course") -> dict[str, Any]:
+    """يمثّل الباقة كـJSON بسيط (كل الحقول القابلة للحفظ + الملفات + الترتيب)."""
+    out: dict[str, Any] = {}
+    for name, value in c.__dict__.items():
+        if name in SAVE_SKIP or name.startswith("_"):
+            continue
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            out[name] = value
+    out["files"] = [{"idx": f.idx, "name": f.name, "size": f.size,
+                     "path": f.path, "kind": f.kind} for f in c.files]
+    out["order"] = list(c.order)
+    out["notes"] = c.notes[-60:]
+    out["tg_messages"] = list(c.tg_messages[-20:])
+    out["fetch_errors"] = list(c.fetch_errors[-20:])
+    out["zip_path"] = c.zip_path
+    return out
+
+
+def _hydrate(d: dict[str, Any]) -> "Course" | None:
+    try:
+        c = Course(id=str(d["id"]), owner=str(d.get("owner") or "me"),
+                   name=str(d.get("name") or "course"))
+        for name, value in d.items():
+            if name in ("id", "owner", "name", "files", "order", "notes",
+                        "tg_messages", "fetch_errors"):
+                continue
+            if hasattr(c, name):
+                setattr(c, name, value)
+        c.files = [CourseFile(idx=int(f["idx"]), name=str(f["name"]),
+                              size=int(f.get("size") or 0), path=str(f.get("path") or ""),
+                              kind=str(f.get("kind") or "other"))
+                   for f in d.get("files") or []]
+        c.order = list(d.get("order") or [])
+        c.notes = list(d.get("notes") or [])
+        c.tg_messages = list(d.get("tg_messages") or [])
+        c.fetch_errors = list(d.get("fetch_errors") or [])
+        return c
+    except Exception:
+        return None
+
+
+def save() -> None:
+    """يحفظ فهرس الباقات على القرص (ذرّي) — يعيش الطابور عبر إعادة تشغيل السيرفر."""
+    try:
+        path = state_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with _LOCK:
+            payload = {"version": 1, "saved_at": time.time(),
+                       "courses": [_dump(c) for c in COURSES.values()]}
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            import json as _json
+            _json.dump(payload, fh, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception as exc:                     # noqa: BLE001
+        print(f"[courses] تعذّر حفظ الفهرس: {exc}", flush=True)
+
+
+def load() -> int:
+    """يستعيد الباقات من القرص بعد إعادة التشغيل (ويتخطى ما فُقدت ملفاته)."""
+    path = state_path()
+    if not os.path.exists(path):
+        return 0
+    try:
+        import json as _json
+        with open(path, encoding="utf-8") as fh:
+            payload = _json.load(fh)
+    except Exception as exc:                     # noqa: BLE001
+        print(f"[courses] فهرس تالف — يُهمَل: {exc}", flush=True)
+        return 0
+    restored = 0
+    for row in payload.get("courses") or []:
+        c = _hydrate(row)
+        if c is None:
+            continue
+        # أسقط الملفات التي اختفت من القرص
+        c.files = [f for f in c.files if f.path and os.path.exists(f.path)]
+        if not c.files and c.state in ("ready", "packing"):
+            c.state = "error"
+            c.error = "ملفات الباقة غير موجودة على القرص بعد إعادة التشغيل."
+        COURSES[c.id] = c
+        restored += 1
+    print(f"[courses] استُعيدت {restored} باقة من القرص", flush=True)
+    return restored
+
+
 def safe_name(name: str, fallback: str = "course") -> str:
     try:
         return media.safe_name(name, 0, fallback)
@@ -181,6 +275,7 @@ def create(owner: str, name: str, delivery: str = "zip", cloud: str = "mega",
     with _LOCK:
         COURSES[cid] = course
     course.note(f"📥 فتحت باقة الدورة «{course.name}» ({course.delivery})")
+    save()
     return course
 
 
@@ -238,6 +333,7 @@ def set_delivery(course: "Course", delivery: str) -> str:
             return course.delivery
         course.delivery = "folder" if str(delivery).lower() in ("folder", "dir") else "zip"
     course.note(f"📦 طريقة التسليم: {'مجلد' if course.delivery == 'folder' else 'ZIP'}")
+    save()
     return course.delivery
 
 

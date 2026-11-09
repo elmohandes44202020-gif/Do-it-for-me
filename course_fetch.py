@@ -78,6 +78,19 @@ def safe_filename(name: str, fallback: str = "file") -> str:
     return (base or fallback)[:120]
 
 
+def srt_to_text(srt_text: str) -> str:
+    """يستخرج النص العربي وحده من SRT: بلا أرقام أسطر ولا توقيتات (نسخة قراءة)."""
+    out: list[str] = []
+    for line in (srt_text or "").replace("\r", "").split("\n"):
+        low = line.strip()
+        if not low or low.isdigit() or "-->" in low:
+            continue
+        if low.upper().startswith(("WEBVTT", "NOTE", "STYLE", "REGION")):
+            continue
+        out.append(low)
+    return "\n".join(out).strip() + "\n"
+
+
 def vtt_to_srt(text: str) -> str:
     """VTT ⇒ SRT. يحذف الترويسات والأوسمة ويحوّل الفواصل إلى فاصلة عشرية."""
     lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
@@ -176,13 +189,14 @@ def _mux(video: str, srt: str, out: str) -> bool:
 
 # ───────────────────────── العملية الرئيسية ─────────────────────────
 def start(course: "courses.Course", items: list[dict], cookie: str = "",
-          user_agent: str = "", embed: bool = True) -> None:
-    threading.Thread(target=_run, args=(course, items, cookie, user_agent, embed),
+          user_agent: str = "", embed: bool = True, text: bool = False) -> None:
+    """text=True ⇒ مع كل محاضرة ملف ترجمة نصي .ar.txt بجانب .ar.srt (0.9.8)."""
+    threading.Thread(target=_run, args=(course, items, cookie, user_agent, embed, text),
                      daemon=True, name="course-fetch").start()
 
 
 def _run(course: "courses.Course", items: list[dict], cookie: str,
-         user_agent: str, embed: bool) -> None:
+         user_agent: str, embed: bool, text: bool = False) -> None:
     course.fetch_state = "fetching"
     course.fetch_done = 0
     course.fetch_total = max(1, len(items))
@@ -226,6 +240,10 @@ def _run(course: "courses.Course", items: list[dict], cookie: str,
                         raise RuntimeError("ملف الترجمة غير مفهوم (لا توقيتات)")
                     with open(srt_path, "w", encoding="utf-8") as fh:
                         fh.write(srt_text)
+                    if text:                     # نسخة نصية بلا توقيتات (ملف نصي لكل محاضرة)
+                        txt_path = os.path.join(tmp_dir, f"{i:03d}.ar.txt")
+                        with open(txt_path, "w", encoding="utf-8") as fh:
+                            fh.write(srt_to_text(srt_text))
                     os.remove(raw)
 
                 final_video = os.path.join(tmp_dir, f"{i:03d}-final.mp4")
@@ -245,6 +263,10 @@ def _run(course: "courses.Course", items: list[dict], cookie: str,
                 courses.attach(course, use_video, name, kind)
                 if srt_path:
                     courses.attach(course, srt_path, stem + ".ar.srt", "srt")
+                    if text:
+                        tp = os.path.join(tmp_dir, f"{i:03d}.ar.txt")
+                        if os.path.exists(tp):
+                            courses.attach(course, tp, stem + ".ar.txt", "txt")
                 course.fetch_done = i
             except Exception as e:                       # noqa: BLE001
                 course.fetch_errors.append(
