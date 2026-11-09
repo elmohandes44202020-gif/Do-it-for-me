@@ -441,7 +441,7 @@ def diag(_owner: str = Depends(auth)) -> dict:
 
     return {
         "ok": True,
-        "version": "0.9.9",
+        "version": "0.9.10",
         "uptime_sec": round(now - STARTED_AT, 1),
         "mega": mega_up.info(),
         "memory": {"rss_mb": rss_mb,
@@ -462,7 +462,7 @@ def healthz() -> dict:
     return {
         "ok": True,
         "service": "notebooklm-mp3",
-        "version": "0.9.9",
+        "version": "0.9.10",
         "python": sys.version.split()[0],
         "pyav": getattr(_av, "__version__", "?"),
         "jobs": len(JOBS),
@@ -563,7 +563,7 @@ def diagnose(req: DiagnoseRequest, owner: str = Depends(auth)) -> dict:
         "referer_sent": bool(req.referer),
         "server": {
             "service": "notebooklm-mp3",
-            "version": "0.9.9",
+            "version": "0.9.10",
             "python": sys.version.split()[0],
             "platform": platform.platform(),
             "pyav": getattr(_av, "__version__", "?"),
@@ -1784,8 +1784,12 @@ class CourseRequest(BaseModel):
 
 def _own_course(cid: str, owner: str) -> "courses.Course":
     c = courses.get(cid)
-    if not c or c.owner != owner:
-        raise HTTPException(404, "باقة الدورة غير موجودة")
+    if not c:
+        # 0.9.10: رسالة صريحة — التطبيق يعرف أنها انتهت ويُنشئ باقة جديدة تلقائيًا
+        raise HTTPException(404, "باقة الدورة غير موجودة على السيرفر (انتهت بعد إعادة تشغيل أو نشر) "
+                                 "— أنشئ باقة جديدة أو أعد المحاولة من التطبيق.")
+    if c.owner != owner:
+        raise HTTPException(409, "هذه الباقة لمفتاح API آخر — استخدم نفس المفتاح أو ابدأ باقة جديدة.")
     return c
 
 
@@ -1795,6 +1799,41 @@ def create_course(req: CourseRequest, owner: str = Depends(auth)) -> dict:
                        mega_sid=req.mega_session, tg_sid=req.tg_session)
     return {"course_id": c.id, "name": c.name, "delivery": c.delivery,
             "cloud": c.cloud, "state": c.state}
+
+
+class CourseEnsureRequest(BaseModel):
+    course_id: str = ""             # المعرّف المحفوظ في التطبيق
+    name: str = "course"
+    delivery: str = "zip"
+    cloud: str = "mega"
+    auto: bool = True
+    mega_session: str = ""
+    tg_session: str = ""
+
+
+@app.post("/courses/ensure")
+def ensure_course(req: CourseEnsureRequest, owner: str = Depends(auth)) -> dict:
+    """0.9.10: يعيد الباقة إن كانت حيّة على السيرفر، وإلا ينشئ باقة جديدة بنفس الاسم.
+
+    يحل «باقة الدورة غير موجودة» بعد إعادة تشغيل السيرفر/النشر بلا أي خطوة من المستخدم.
+    """
+    c = courses.get(req.course_id) if req.course_id else None
+    if c is not None and c.owner != owner:
+        raise HTTPException(409, "هذه الباقة لمفتاح API آخر — استخدم نفس المفتاح أو ابدأ باقة جديدة.")
+    if c is not None and c.state in ("uploading", "fetching", "error"):
+        return {"course_id": c.id, "state": c.state, "recreated": False,
+                "count": len(c.files), "name": c.name, "cloud": c.cloud,
+                "note": "الباقة الأصلية موجودة — نُكمل عليها."}
+    new = courses.create(owner, req.name or "course", req.delivery, req.cloud, req.auto,
+                         mega_sid=req.mega_session, tg_sid=req.tg_session)
+    try:
+        courses.save()
+    except Exception:                                    # noqa: BLE001
+        pass
+    return {"course_id": new.id, "state": new.state, "recreated": True, "count": 0,
+            "name": new.name, "cloud": new.cloud,
+            "note": ("الباقة القديمة انتهت على السيرفر — أنشأنا باقة جديدة."
+                     if req.course_id else "باقة جديدة جاهزة.")}
 
 
 @app.get("/courses")
