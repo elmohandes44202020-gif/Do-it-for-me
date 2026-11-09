@@ -72,6 +72,50 @@ def env_info() -> dict:
 
 
 # ─────────────────────────── استدعاءات API ───────────────────────────
+# ─────────────────── رسائل تيليجرام ⇒ عربية مفهومة ───────────────────
+# المستخدم لا يجب أن يرى نص Bot API الخام أبدًا (طلب صريح: لا أخطاء تقنية).
+FRIENDLY = (
+    ("can't send messages to the bot",
+     "معرّف المحادثة المربوط هو البوت نفسه — لا يستطيع البوت أن يراسل نفسه. "
+     "اضغط «🔎 اكتشف معرّفي» في خطوة تيليجرام، أو أرسل /start للبوت واستخدم معرّفك الشخصي."),
+    ("bots can't send messages to bots",
+     "معرّف المحادثة المربوط هو بوت آخر — استخدم محادثتك الشخصية مع البوت."),
+    ("peer_id_invalid",
+     "معرّف المحادثة غير صالح — افتح البوت واضغط /start ثم أعد الربط."),
+    ("chat not found",
+     "لم أجد هذه المحادثة: تأكد أنك فتحت البوت وضغطت /start، وأن المعرّف هو معرّفك الشخصي."),
+    ("bot was blocked by the user",
+     "أنت حاجب البوت — افتح محادثة البوت في تيليجرام وأزل الحجب ثم أعد المحاولة."),
+    ("user is deactivated",
+     "حساب تيليجرام المستخدم غير مُفعّل — استخدم حسابًا آخر أو أعد /start للبوت."),
+    ("bot can't initiate conversation",
+     "البوت لا يستطيع بدء المحادثة: افتح محادثة البوت واضغط /start أولًا."),
+    ("not enough rights",
+     "البوت ليس عضوًا في هذه المحادثة أو لا يملك صلاحية إرسال الملفات فيها."),
+    ("chat_write_forbidden",
+     "لا صلاحية كتابة في هذه المحادثة — استخدم محادثة خاصة مع البوت."),
+    ("unauthorized",
+     "توكن البوت غير صحيح أو تم إلغاؤه — انسخ توكنًا جديدًا من @BotFather."),
+    ("file is too big",
+     "الملف أكبر من حد تيليجرام — بدّل التسليم إلى «مجلد» أو استخدم MEGA."),
+    ("too many requests",
+     "تيليجرام يطلب مهلة قصيرة — أعد المحاولة بعد ثوانٍ."),
+    ("timed out", "انتهت مهلة الاتصال بتيليجرام — تحقّق من الشبكة وأعد المحاولة."),
+)
+
+
+def friendly_error(desc: str) -> str:
+    """يحوّل وصف خطأ Bot API إلى جملة عربية واحدة مفهومة (بلا مصطلحات)."""
+    text = str(desc or "").strip()
+    low = text.lower()
+    for needle, arabic in FRIENDLY:
+        if needle in low:
+            return arabic
+    if not text:
+        return "تعذّر الإرسال إلى تيليجرام — أعد المحاولة."
+    return "تعذّر الإرسال إلى تيليجرام: " + text[:160]
+
+
 def _url(token: str, method: str) -> str:
     return f"{API_BASE}/bot{token}/{method}"
 
@@ -99,8 +143,8 @@ def _call(token: str, method: str, data: dict | None = None,
                 time.sleep(min(30.0, wait))
                 last = RuntimeError(f"Telegram 429 — انتظر {int(wait)} ثانية")
                 continue
-            desc = str(body.get("description") or f"HTTP {r.status_code}")
-            last = RuntimeError(f"Telegram: {desc}")
+            desc = str(body.get("description") or "")
+            last = RuntimeError(friendly_error(desc if desc else f"HTTP {r.status_code}"))
             if r.status_code in (400, 401, 403, 404):
                 raise last
             time.sleep(1.5 * attempt)
@@ -126,19 +170,88 @@ def chat_ok(token: str, chat: str) -> dict:
     return {"id": r.get("id"), "type": r.get("type") or "", "title": r.get("title") or r.get("username") or ""}
 
 
+FAKE_CHAT = (os.environ.get("NW_FAKE_TG_CHAT") or "555000").strip()
+
+
+def detect_chat(token: str) -> dict:
+    """يستنتج معرّف محادثتك من آخر رسالة وصلت للبوت (بعد /start).
+
+    كان هذا هو سبب فشل «the bot can't send messages to the bot»: المستخدم يكتب
+    معرّفًا خاطئًا (معرّف البوت نفسه) ولا طريقة سهلة لمعرفة معرّفه الحقيقي.
+    """
+    token = (token or "").strip()
+    if not token:
+        raise RuntimeError("توكن البوت مطلوب لاكتشاف المحادثة.")
+    if FAKE:
+        return {"id": FAKE_CHAT, "type": "private", "title": "محادثتك التجريبية"}
+    updates = _call(token, "getUpdates", {"limit": 100, "timeout": 0,
+                                          "allowed_updates": '["message"]'}, timeout=60)
+    rows = updates if isinstance(updates, list) else []
+    picked = None
+    for upd in reversed(rows):                     # الأحدث أولًا
+        msg = (upd or {}).get("message") or (upd or {}).get("edited_message") or {}
+        chat = msg.get("chat") or {}
+        if chat.get("id") is None:
+            continue
+        if (chat.get("type") or "") not in ("private", "group", "supergroup", "channel"):
+            continue
+        picked = chat
+        break
+    if picked is None:
+        raise RuntimeError("لم أجد أي رسالة: افتح محادثة البوت في تيليجرام واضغط /start "
+                           "ثم اضغط «🔎 اكتشف معرّفي» مرة أخرى.")
+    return {"id": picked.get("id"), "type": picked.get("type") or "private",
+            "title": picked.get("title") or picked.get("username")
+            or picked.get("first_name") or ""}
+
+
+def resolve_chat(token: str, chat: str) -> tuple[str, str]:
+    """يعيد (المعرّف الصحيح, ملاحظة للمستخدم). يصحّح تلقائيًا معرّف البوت نفسه.
+
+    سبب جذري: كان السيرفر يقبل معرّف البوت لأن getChat ينجح عليه، فيظهر الخطأ
+    متأخرًا أثناء الإرسال بصيغة «the bot can't send messages to the bot».
+    الآن يُصحّح عند الربط وعند الإرسال، والملاحظة تُعرض للمستخدم بالعربية.
+    """
+    chat = (chat or "").strip()
+    if FAKE:
+        if chat and chat != str(me(token).get("id")):
+            return chat, ""
+        found = detect_chat(token)
+        note = ("🔧 كان معرّف المحادثة هو البوت نفسه أو فارغًا — "
+                f"صُحّح تلقائيًا إلى محادثتك ({found['id']}).") if chat else ""
+        return str(found["id"]), note
+    bot_id = str((me(token) or {}).get("id") or "")
+    if chat and (not bot_id or chat != bot_id):
+        return chat, ""
+    found = detect_chat(token)
+    if str(found["id"]) == bot_id:
+        raise RuntimeError("لم أجد محادثتك: افتح البوت واضغط /start ثم أعد الربط.")
+    note = ("🔧 كان معرّف المحادثة هو البوت نفسه — صحّحته تلقائيًا إلى محادثتك "
+            f"({found['id']})، والرسائل ستصل هناك.") if chat else ""
+    return str(found["id"]), note
+
+
 # ─────────────────────────── الجلسات ───────────────────────────
 def create_session(token: str, chat: str) -> str:
     token = (token or "").strip()
     chat = (chat or "").strip()
-    if not token or not chat:
-        raise RuntimeError("توكن البوت ومعرّف المحادثة مطلوبان")
+    if not token:
+        raise RuntimeError("توكن البوت مطلوب (من @BotFather).")
     info = me(token)                       # تحقق فعلي من التوكن قبل تخزينه
+    bot_id = str(info.get("id") or "")
+    note = ""
+    if not chat or (bot_id and chat == bot_id):
+        # الشائع: المستخدم كتب معرّف البوت نفسه ⇒ نكتشف محادثته بدل الفشل لاحقًا.
+        chat, note = resolve_chat(token, chat)
     chat_info = chat_ok(token, chat)
+    if bot_id and str(chat_info.get("id") or "") == bot_id:
+        raise RuntimeError("هذا معرّف البوت نفسه — البوت لا يستطيع إرسال رسائل لنفسه. "
+                           "أرسل /start للبوت ثم اضغط «🔎 اكتشف معرّفي» لتعبئة معرّفك الصحيح.")
     sid = os.urandom(12).hex()
     with _LOCK:
         SESSIONS[sid] = {"token": token, "chat": chat, "at": time.time(),
                          "bot": info.get("username") or "", "chat_info": chat_info,
-                         "uploads": 0, "messages": 0}
+                         "note": note, "uploads": 0, "messages": 0}
     return sid
 
 
@@ -173,7 +286,9 @@ def session_info(sid: str) -> dict:
     s0 = session(sid)
     if not s0:
         return {"alive": False}
+    info = s0.get("chat_info") or {}
     return {"alive": True, "bot": s0.get("bot"), "chat": s0.get("chat"),
+            "chat_type": info.get("type", ""), "note": s0.get("note", ""),
             "uploads": s0.get("uploads", 0), "messages": s0.get("messages", 0),
             "expires_in_sec": max(0, int(SESS_TTL - (time.time() - s0["at"])))}
 

@@ -241,12 +241,13 @@ def upload(path: str, remote_name: str,
     def worker() -> None:
         t0 = time.time()
         try:
-            on_state(state="uploading", percent=0)
+            # ملف واحد هو وحدة الرفع هنا (نسخة ZIP أو مجلد مضغوط) ⇒ العدّاد 0/1 ثم 1/1
+            on_state(state="uploading", percent=0, files_done=0, files_total=1)
             if FAKE:
                 time.sleep(0.05)
                 link = _fake_link("file", remote_name)
                 on_state(state="done", percent=100, link=link, folder_link=link,
-                         seconds=round(time.time() - t0, 1))
+                         files_done=1, files_total=1, seconds=round(time.time() - t0, 1))
                 return
             m = client if client is not None else _client()
             dest = _folder(m)
@@ -295,7 +296,7 @@ def upload(path: str, remote_name: str,
                     link = ""
             if not link:
                 raise RuntimeError("تم الرفع لكن تعذّر إنشاء رابط عام")
-            on_state(state="link", percent=100, link=link,
+            on_state(state="link", percent=100, link=link, files_done=1, files_total=1,
                      seconds=round(time.time() - t0, 1))
             # مجلد مشترك: نحاول إنشاء رابط للمجلد لعرض كل الملفات
             try:
@@ -303,7 +304,7 @@ def upload(path: str, remote_name: str,
             except Exception:
                 fl = ""
             on_state(state="done", percent=100, link=link, folder_link=fl,
-                     seconds=round(time.time() - t0, 1))
+                     files_done=1, files_total=1, seconds=round(time.time() - t0, 1))
         except Exception as e:                       # noqa: BLE001
             if client is None:
                 _reset()
@@ -480,7 +481,8 @@ def _children(m: Any, parent: str) -> dict[str, int]:
 
 
 def upload_folder(client: Any, files: list[dict], folder_name: str,
-                  on_state: Callable[..., None]) -> threading.Thread:
+                  on_state: Callable[..., None],
+                  sub: str | None = None) -> threading.Thread:
     """يرفع الملفات داخل: مجلد باسم الدفتر ← مجلد «تم الترتيب» ← الملفات.
 
     إصلاح 0.9.0 (سبب «توقف الرفع في المنتصف» + «فشل timeout»):
@@ -520,7 +522,8 @@ def upload_folder(client: Any, files: list[dict], folder_name: str,
             m = client if client is not None else _client()
             parent = _folder(m)                      # مجلد NoteWorm (قد يكون None)
             root = _ensure_folder(m, folder_name, parent)
-            inner = _ensure_folder(m, SORTED_NAME, root)
+            sub_name = SORTED_NAME if sub is None else str(sub)
+            inner = _ensure_folder(m, sub_name, root) if sub_name else root
             existing = _children(m, inner)
             for f in files:
                 path = f.get("path")

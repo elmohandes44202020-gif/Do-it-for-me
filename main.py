@@ -41,6 +41,7 @@ from pydantic import BaseModel, Field
 import av as _av
 import mega_up
 import tg_up
+import courses
 import notecol as colls
 import links
 import media
@@ -337,6 +338,10 @@ def _worker_loop() -> None:
 def _janitor_loop() -> None:
     while True:
         time.sleep(60)
+        try:
+            courses.janitor()
+        except Exception:
+            pass
         now = time.time()
         with LOCK:
             stale = [
@@ -353,6 +358,7 @@ def _startup() -> None:
     shutil.rmtree(WORK_DIR, ignore_errors=True)   # لا بقايا من تشغيل سابق
     os.makedirs(WORK_DIR, exist_ok=True)
     colls.ON_READY = _auto_mega          # الرفع التلقائي إلى MEGA
+    courses.ON_READY = _auto_mega        # باقات كورسيرا تستخدم نفس المحرّك
     threading.Thread(target=_worker_loop, daemon=True, name="nlm-worker").start()
     threading.Thread(target=_mega_engine, daemon=True, name="nlm-mega-engine").start()
     threading.Thread(target=_janitor_loop, daemon=True, name="nlm-janitor").start()
@@ -414,7 +420,7 @@ def diag(_owner: str = Depends(auth)) -> dict:
 
     return {
         "ok": True,
-        "version": "0.9.1",
+        "version": "0.9.3",
         "uptime_sec": round(now - STARTED_AT, 1),
         "mega": mega_up.info(),
         "memory": {"rss_mb": rss_mb,
@@ -435,7 +441,7 @@ def healthz() -> dict:
     return {
         "ok": True,
         "service": "notebooklm-mp3",
-        "version": "0.9.1",
+        "version": "0.9.3",
         "python": sys.version.split()[0],
         "pyav": getattr(_av, "__version__", "?"),
         "jobs": len(JOBS),
@@ -536,7 +542,7 @@ def diagnose(req: DiagnoseRequest, owner: str = Depends(auth)) -> dict:
         "referer_sent": bool(req.referer),
         "server": {
             "service": "notebooklm-mp3",
-            "version": "0.9.1",
+            "version": "0.9.3",
             "python": sys.version.split()[0],
             "platform": platform.platform(),
             "pyav": getattr(_av, "__version__", "?"),
@@ -1110,14 +1116,14 @@ def mega_open_session(req: MegaSessionReq, owner: str = Depends(auth)) -> dict:
         email, password = mega_up.open_sealed(req.sealed)
     except Exception as e:                    # noqa: BLE001
         raise HTTPException(status_code=400,
-                            detail="تعذّر فك التشفير: " + type(e).__name__)
+                            detail="تعذّر فك الظرف المشفّر — أعد المحاولة من التطبيق")
     if not email or not password:
         raise HTTPException(status_code=400, detail="البريد أو كلمة المرور ناقص")
     try:
         sid = mega_up.create_session(email, password)
     except Exception as e:                    # noqa: BLE001
-        msg = f"{type(e).__name__}: {e}"
-        low = msg.lower()
+        msg = _user_error(e)
+        low = str(e).lower()
         if ("jsondecode" in low or "connection" in low or "timeout" in low
                 or "timed out" in low or "getaddrinfo" in low):
             msg = "تعذّر الوصول إلى ميجا من السيرفر (شبكة/حجب) — جرّب لاحقًا"
@@ -1227,8 +1233,10 @@ def _mega_run(col: "colls.Collection", sid: str, wipe: bool = False) -> None:
         if st == "done":
             col.mega_percent = 100
             col.mega_current = ""
+            what = ("نسخة ZIP واحدة" if col.delivery != "folder"
+                    else f"{col.mega_files_done} ملف")
             col.note(f"☁️ تم الرفع إلى MEGA: /{col.mega_folder}/{col.mega_sub or ''}"
-                     f" — {col.mega_files_done} ملف"
+                     f" — {what}"
                      + (f" (تُخطّي {col.mega_skipped} موجود)" if col.mega_skipped else ""))
         elif st == "error":
             col.note("❌ فشل الرفع إلى MEGA: " + col.mega_error[:120])
@@ -1246,7 +1254,8 @@ def _mega_run(col: "colls.Collection", sid: str, wipe: bool = False) -> None:
             col.mega_bytes = sum(int(e.get("size") or 0) for e in col.order)
             col.note(f"☁️ رفع مجلد «{col.name}» ({len(payload)} ملف) إلى MEGA…")
             cli = sess["client"] if sess is not None else None
-            mega_up.upload_folder(cli, payload, col.name, on_state)
+            mega_up.upload_folder(cli, payload, col.name, on_state,
+                                  sub=getattr(col, "cloud_sub", None))
             if sess is not None and wipe:
                 mega_up.drop_session(sid)
                 col.note("🔒 مُسحت بيانات الجلسة من ذاكرة السيرفر")
@@ -1266,13 +1275,28 @@ def _mega_run(col: "colls.Collection", sid: str, wipe: bool = False) -> None:
             mega_up.upload(zip_path, remote, on_state)
     except Exception as e:                    # noqa: BLE001
         col.mega_state = "error"
-        col.mega_error = f"{type(e).__name__}: {e}"[:300]
-        col.note("❌ فشل الرفع إلى MEGA: " + col.mega_error[:120])
+        col.mega_error = _user_error(e)
+        col.note("❌ فشل الرفع إلى MEGA: " + col.mega_error[:160])
         try:
             if os.path.exists(zip_path):
                 os.remove(zip_path)
         except Exception:
             pass
+
+
+def _user_error(err: BaseException) -> str:
+    """جملة واحدة مفهومة للمستخدم بدل «ClassName: raw text» (طلب صريح: لا خطأ تقني)."""
+    text = str(err).strip()
+    low = text.lower()
+    if not text:
+        return "تعذّر إكمال العملية — أعد المحاولة."
+    if ("jsondecode" in low or "getaddrinfo" in low or "connection" in low
+            or "timed out" in low or "timeout" in low):
+        return "تعذّر الوصول إلى الشبكة من السيرفر — أعد المحاولة بعد قليل."
+    if isinstance(err, (RuntimeError, ValueError, KeyError)) or text[:1].isalpha():
+        # رسائلنا العربية والأخطاء المفهومة تُعرض كما هي بلا اسم الكلاس
+        return text[:300]
+    return f"{type(err).__name__}: {text}"[:300]
 
 
 def _tg_run(col: "colls.Collection", sid: str) -> None:
@@ -1285,6 +1309,22 @@ def _tg_run(col: "colls.Collection", sid: str) -> None:
         col.tg_error = "لا جلسة تيليجرام صالحة — اربط البوت من التطبيق أولًا"
         col.note("❌ " + col.tg_error)
         return
+    # 0.9.3: معرّف المحادثة قد يكون البوت نفسه (سبب «the bot can't send messages
+    # to the bot») ⇒ نصحّحه تلقائيًا بدل إفشال الرفع، ونخبر المستخدم بجملة واحدة.
+    if sess is not None:
+        try:
+            fixed, note = tg_up.resolve_chat(token, chat)
+            if note:
+                col.note(note)
+            if fixed and fixed != chat:
+                chat = fixed
+                sess["chat"] = fixed
+                col.tg_chat_fixed = True
+        except Exception as chat_problem:      # noqa: BLE001
+            col.tg_state = "error"
+            col.tg_error = str(chat_problem)[:300]
+            col.note("❌ " + col.tg_error)
+            return
     col.tg_state = "uploading"
     col.tg_percent = 0
     col.tg_error = ""
@@ -1333,8 +1373,8 @@ def _tg_run(col: "colls.Collection", sid: str) -> None:
                  + (f" (البوت @{col.tg_bot})" if col.tg_bot else ""))
     except Exception as e:                    # noqa: BLE001
         col.tg_state = "error"
-        col.tg_error = f"{type(e).__name__}: {e}"[:300]
-        col.note("❌ فشل الإرسال إلى تيليجرام: " + col.tg_error[:140])
+        col.tg_error = _user_error(e)
+        col.note("❌ فشل الإرسال إلى تيليجرام: " + col.tg_error[:160])
     finally:
         try:
             if os.path.exists(zip_path):
@@ -1355,7 +1395,7 @@ def _mega_engine() -> None:
                     MEGA_STAT["current_name"] = ""
                     break
                 item = MEGA_Q[0]
-                col = colls.get(item["col"])
+                col = colls.get(item["col"]) or courses.get(item["col"])
                 if col is None:
                     MEGA_Q.pop(0)
                     continue
@@ -1461,10 +1501,37 @@ def tg_open_session(req: MegaSessionReq, owner: str = Depends(auth)) -> dict:
     except Exception as e:                    # noqa: BLE001
         raise HTTPException(400, f"{e}")
     s0 = tg_up.session(sid) or {}
-    return {"session_id": sid, "bot": s0.get("bot", ""), "chat": chat,
+    real_chat = s0.get("chat") or chat
+    return {"session_id": sid, "bot": s0.get("bot", ""), "chat": real_chat,
+            "chat_fixed": real_chat != chat, "note": s0.get("note", ""),
             "chat_type": (s0.get("chat_info") or {}).get("type", ""),
             "max_mb": tg_up.MAX_MB,
             "expires_in_sec": tg_up.SESS_TTL}
+
+
+@app.post("/tg/detect")
+def tg_detect_chat(req: MegaSessionReq, owner: str = Depends(auth)) -> dict:
+    """يكتشف معرّف محادثتك من آخر رسالة وصلت للبوت — يمنع خطأ «البوت يراسل نفسه».
+
+    الظرف المشفّر يحتوي التوكن فقط (سطر واحد) أو «token\nchat» ويُتجاهل الشات.
+    """
+    try:
+        token, _chat = tg_up.open_sealed(req.sealed)
+    except Exception:                          # noqa: BLE001
+        raise HTTPException(400, "تعذّر فك الظرف المشفّر — أعد المحاولة من التطبيق")
+    if not token:
+        raise HTTPException(400, "توكن البوت مطلوب لاكتشاف المحادثة.")
+    try:
+        found = tg_up.detect_chat(token)
+    except Exception as e:                     # noqa: BLE001
+        raise HTTPException(400, _user_error(e))
+    try:
+        bot = tg_up.me(token).get("username") or ""
+    except Exception:                          # noqa: BLE001
+        bot = ""
+    return {"chat": str(found.get("id")), "type": found.get("type") or "",
+            "title": found.get("title") or "", "bot": bot,
+            "max_mb": tg_up.MAX_MB}
 
 
 @app.get("/tg/session/{sid}")
@@ -1572,6 +1639,159 @@ def tg_file(col_id: str, idx: int, t: str | None = None,
     return StreamingResponse(stream, media_type="application/octet-stream", headers=headers)
 
 
+# ─────────────── باقات Coursera: ZIP/مجلد باسم الدورة ثم سحابة (0.9.2) ───────────────
+class CourseRequest(BaseModel):
+    name: str = "course"
+    delivery: str = "zip"          # zip | folder
+    cloud: str = "mega"            # mega | telegram
+    auto: bool = True              # ارفع تلقائيًا بعد التجهيز
+    mega_session: str = ""
+    tg_session: str = ""
+
+
+def _own_course(cid: str, owner: str) -> "courses.Course":
+    c = courses.get(cid)
+    if not c or c.owner != owner:
+        raise HTTPException(404, "باقة الدورة غير موجودة")
+    return c
+
+
+@app.post("/courses", status_code=202)
+def create_course(req: CourseRequest, owner: str = Depends(auth)) -> dict:
+    c = courses.create(owner, req.name, req.delivery, req.cloud, req.auto,
+                       mega_sid=req.mega_session, tg_sid=req.tg_session)
+    return {"course_id": c.id, "name": c.name, "delivery": c.delivery,
+            "cloud": c.cloud, "state": c.state}
+
+
+@app.get("/courses")
+def list_courses(owner: str = Depends(auth)) -> dict:
+    rows = [c.public() for c in courses.COURSES.values() if c.owner == owner]
+    rows.sort(key=lambda r: r["created"], reverse=True)
+    return {"courses": rows, "count": len(rows)}
+
+
+@app.post("/courses/{cid}/files", status_code=201)
+async def upload_course_file(cid: str, request: Request, name: str = "file",
+                             kind: str = "other", owner: str = Depends(auth)) -> dict:
+    """يستقبل ملفًا واحدًا بالبثّ من الهاتف (فيديو MP4 / SRT / TXT …)."""
+    c = _own_course(cid, owner)
+    if c.state != "uploading":
+        raise HTTPException(409, "الباقة أُقفلت — أنشئ باقة جديدة")
+    try:
+        slot = courses.reserve(c, name, kind)
+    except Exception as e:                       # noqa: BLE001
+        raise HTTPException(400, f"{e}")
+    limit = courses.MAX_MB * 1024 * 1024
+    size = 0
+    try:
+        with open(slot["path"], "wb") as fh:
+            async for chunk in request.stream():
+                if not chunk:
+                    continue
+                size += len(chunk)
+                if size > limit:
+                    raise RuntimeError("حجم الملف تجاوز الحد المسموح للباقة")
+                fh.write(chunk)
+    except Exception as e:                       # noqa: BLE001
+        try:
+            os.remove(slot["path"])
+        except Exception:
+            pass
+        raise HTTPException(400, f"{e}")
+    try:
+        return courses.commit(c, slot, size)
+    except Exception as e:                       # noqa: BLE001
+        raise HTTPException(400, f"{e}")
+
+
+@app.post("/courses/{cid}/finalize", status_code=202)
+def finalize_course(cid: str, owner: str = Depends(auth)) -> dict:
+    c = _own_course(cid, owner)
+    if c.state == "ready":
+        return {"state": "ready", "zip_url": f"/courses/{c.id}/zip"}
+    courses.finalize(c)
+    return {"state": "packing", "count": len(c.files)}
+
+
+@app.get("/courses/{cid}")
+def course_state(cid: str, request: Request, owner: str = Depends(auth)) -> dict:
+    c = _own_course(cid, owner)
+    d = c.public(_public_base(request))
+    if d.get("zip_url"):
+        d["zip_url_signed"] = f"{_public_base(request)}/courses/{c.id}/zip?t="                               f"{sign_link('c', c.id)}"
+    return d
+
+
+@app.get("/courses/{cid}/zip")
+def course_zip(cid: str, t: str | None = None, x_api_key: str | None = Header(default=None)):
+    if t and check_link("c", cid, t):
+        c = courses.get(cid)
+        if not c:
+            raise HTTPException(404, "الباقة غير موجودة")
+    else:
+        c = _own_course(cid, auth(x_api_key))
+    if c.state != "ready" or not c.order:
+        raise HTTPException(409, "الباقة لم تجهز بعد")
+    if c.delivery == "folder":
+        raise HTTPException(400, "هذه باقة «مجلد» — نزّل الملفات فرادى")
+    entries, total = courses.zip_entries(c)
+    name = (c.name or "course") + ".zip"
+    headers = {"Content-Disposition": cd_header(name), "Content-Length": str(total),
+               "X-Total-Bytes": str(total), "X-Files": str(len(entries)),
+               "Cache-Control": "no-store"}
+    return StreamingResponse(zipstream.stream_zip(entries), media_type="application/zip",
+                             headers=headers)
+
+
+@app.get("/courses/{cid}/file/{idx}")
+def course_file(cid: str, idx: int, t: str | None = None,
+                x_api_key: str | None = Header(default=None)):
+    if t and check_link("f", cid + ":" + str(idx), t):
+        c = courses.get(cid)
+        if not c:
+            raise HTTPException(404, "الباقة غير موجودة")
+    else:
+        c = _own_course(cid, auth(x_api_key))
+    row = next((e for e in c.order if int(e.get("order") or 0) == idx), None)
+    if not row or not os.path.exists(row["path"]):
+        raise HTTPException(404, "الملف غير موجود")
+    headers = {"Content-Disposition": cd_header(row["name"]),
+               "Content-Length": str(row["size"]), "Cache-Control": "no-store"}
+
+    def stream() -> Any:
+        with open(row["path"], "rb") as fh:
+            while True:
+                chunk = fh.read(1 << 16)
+                if not chunk:
+                    break
+                yield chunk
+
+    mime = "video/mp4" if str(row.get("name", "")).endswith(".mp4") else "application/octet-stream"
+    return StreamingResponse(stream(), media_type=mime, headers=headers)
+
+
+@app.post("/courses/{cid}/cloud", status_code=202)
+def course_cloud(cid: str, req: CourseRequest, owner: str = Depends(auth)) -> dict:
+    """يختار سحابة الباقة أو يبدأ الرفع فورًا إن كانت جاهزة."""
+    c = _own_course(cid, owner)
+    c.cloud = "telegram" if str(req.cloud).lower() in ("telegram", "tg", "bot") else "mega"
+    if req.mega_session:
+        c.mega_sid = req.mega_session
+    if req.tg_session:
+        c.tg_sid = req.tg_session
+    if c.state == "ready" and c.order:
+        _mega_enqueue(c, c.tg_sid if c.cloud == "telegram" else c.mega_sid,
+                      False, auto=False, backend=c.cloud)
+    return {"cloud": c.cloud, "queued": c.state == "ready"}
+
+
+@app.delete("/courses/{cid}")
+def delete_course(cid: str, owner: str = Depends(auth)) -> dict:
+    _own_course(cid, owner)
+    return {"deleted": courses.delete(cid)}
+
+
 @app.get("/queue")
 def global_queue(owner: str = Depends(auth)) -> dict:
     """حالة الطابور العامة: ما يُعالَج الآن، وما يليه — لكل المساحات."""
@@ -1579,16 +1799,27 @@ def global_queue(owner: str = Depends(auth)) -> dict:
         up_order = [it["col"] for it in MEGA_Q]
         current = MEGA_STAT["current"]
     cols = [c for c in colls.COLS.values() if c.owner == owner]
+    cols += [c for c in courses.COURSES.values() if c.owner == owner]
     cols.sort(key=lambda c: c.created_at)
     items = []
     for c in cols:
-        phase = "queued"
-        if c.state in ("pending", "running", "waiting_order"):
-            phase = "processing"
-        elif c.state == "sorting":
-            phase = "sorting"
-        elif c.state in ("done", "partial"):
-            st_cloud = c.tg_state if getattr(c, "cloud", "mega") == "telegram" else c.mega_state
+        is_course = isinstance(c, courses.Course)
+        st_cloud = c.tg_state if getattr(c, "cloud", "mega") == "telegram" else c.mega_state
+        if is_course:
+            base_state = {"uploading": "processing", "packing": "sorting",
+                          "ready": "done", "error": "error"}.get(c.state, "queued")
+            total = len(c.files)
+            done = len(c.files) if c.state == "ready" else 0
+            errors = 0
+        else:
+            base_state = {"pending": "processing", "running": "processing",
+                          "waiting_order": "processing", "sorting": "sorting",
+                          "done": "done", "partial": "done", "error": "error"}.get(c.state, "queued")
+            total = len(c.items)
+            done = sum(1 for i in c.items if i.state == "done")
+            errors = sum(1 for i in c.items if i.state == "error")
+        phase = base_state
+        if base_state == "done":
             if st_cloud in ("queued", "uploading", "link", "done", "error"):
                 phase = ("uploading" if st_cloud in ("uploading", "link")
                          else ("uploaded" if st_cloud == "done"
@@ -1598,9 +1829,8 @@ def global_queue(owner: str = Depends(auth)) -> dict:
         pos = up_order.index(c.id) + 1 if c.id in up_order else 0
         items.append({
             "id": c.id, "name": c.name, "phase": phase, "state": c.state,
-            "total": len(c.items),
-            "done": sum(1 for i in c.items if i.state == "done"),
-            "errors": sum(1 for i in c.items if i.state == "error"),
+            "kind": "course" if is_course else "collection",
+            "total": total, "done": done, "errors": errors,
             "queue_position": pos,
             "is_current": c.id == current,
             "auto_mega": bool(getattr(c, "auto_mega", False)),
