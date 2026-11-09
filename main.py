@@ -40,6 +40,7 @@ from pydantic import BaseModel, Field
 
 import av as _av
 import mega_up
+import tg_up
 import notecol as colls
 import links
 import media
@@ -351,7 +352,9 @@ def _janitor_loop() -> None:
 def _startup() -> None:
     shutil.rmtree(WORK_DIR, ignore_errors=True)   # لا بقايا من تشغيل سابق
     os.makedirs(WORK_DIR, exist_ok=True)
+    colls.ON_READY = _auto_mega          # الرفع التلقائي إلى MEGA
     threading.Thread(target=_worker_loop, daemon=True, name="nlm-worker").start()
+    threading.Thread(target=_mega_engine, daemon=True, name="nlm-mega-engine").start()
     threading.Thread(target=_janitor_loop, daemon=True, name="nlm-janitor").start()
 
 
@@ -411,7 +414,7 @@ def diag(_owner: str = Depends(auth)) -> dict:
 
     return {
         "ok": True,
-        "version": "0.8.1",
+        "version": "0.9.1",
         "uptime_sec": round(now - STARTED_AT, 1),
         "mega": mega_up.info(),
         "memory": {"rss_mb": rss_mb,
@@ -432,7 +435,7 @@ def healthz() -> dict:
     return {
         "ok": True,
         "service": "notebooklm-mp3",
-        "version": "0.8.1",
+        "version": "0.9.1",
         "python": sys.version.split()[0],
         "pyav": getattr(_av, "__version__", "?"),
         "jobs": len(JOBS),
@@ -533,7 +536,7 @@ def diagnose(req: DiagnoseRequest, owner: str = Depends(auth)) -> dict:
         "referer_sent": bool(req.referer),
         "server": {
             "service": "notebooklm-mp3",
-            "version": "0.8.1",
+            "version": "0.9.1",
             "python": sys.version.split()[0],
             "platform": platform.platform(),
             "pyav": getattr(_av, "__version__", "?"),
@@ -989,6 +992,10 @@ class CollectionRequest(BaseModel):
     match: float | None = None
     delivery: str = "zip"          # zip | folder
     files: list[CollectionItem] = Field(default_factory=list)
+    auto_mega: bool = False        # رفع تلقائي بعد انتهاء الترتيب
+    mega_session: str = ""         # جلسة ميجا (تُفتح من التطبيق مرة واحدة)
+    cloud: str = "mega"            # mega | telegram (0.9.1)
+    tg_session: str = ""           # جلسة تيليجرام (توكن مشفّر من الهاتف)
 
 
 class OrderRequest(BaseModel):
@@ -1036,6 +1043,8 @@ def create_collection(req: CollectionRequest, owner: str = Depends(auth)) -> dic
     col = colls.create(
         owner, req.name, [f.model_dump() for f in req.files],
         order_text=req.order_text, match=req.match, delivery=req.delivery,
+        auto_mega=req.auto_mega, mega_sid=req.mega_session,
+        cloud=req.cloud, tg_sid=req.tg_session,
     )
     return {
         "collection_id": col.id,
@@ -1077,7 +1086,8 @@ class MegaSessionReq(BaseModel):
 
 class MegaUploadReq(BaseModel):
     session_id: str = ""
-    wipe_after: bool = False        # الجلسة تبقى للاستخدام التالي (لا نطلب كلمة السر كل مرة)
+    wipe_after: bool = False
+    auto: bool = False        # الجلسة تبقى للاستخدام التالي (لا نطلب كلمة السر كل مرة)
 
 
 @app.get("/mega/key")
@@ -1126,29 +1136,54 @@ def mega_close_session(sid: str, owner: str = Depends(auth)) -> dict:
     return {"closed": mega_up.drop_session(sid)}
 
 
-@app.post("/collections/{col_id}/mega", status_code=202)
-def mega_upload_collection(col_id: str, owner: str = Depends(auth),
-                           req: MegaUploadReq | None = None) -> dict:
-    """رفع ZIP المجموعة إلى حساب MEGA (يبدأ بعد تأكيد المستخدم في التطبيق)."""
-    col = _own_collection(col_id, owner)
-    sid = (req.session_id if req else "") or ""
-    sess = mega_up.session(sid) if sid else None
-    if sess is None and not mega_up.enabled():
-        raise HTTPException(status_code=400, detail=(
-            "لا توجد بيانات ميجا: افتح رفع ميجا من التطبيق وأدخل بريدك مرة واحدة "
-            "(تُرسَل مشفّرة ولا تُخزَّن)، أو اضبط MEGA_EMAIL/MEGA_PASSWORD."))
-    if col.state not in ("done", "partial") or not col.order:
-        raise HTTPException(status_code=409, detail="المجموعة لم تنتهِ بعد")
-    if col.mega_state in ("uploading", "link", "done"):
-        return {"state": col.mega_state, "link": col.mega_link,
-                "error": col.mega_error}
-    total = sum(int(e.get("size") or 0) for e in col.order) or 1
-    free = colls._disk_free_mb()
-    if free < (total / 1048576.0) * 1.25 + 40:
-        raise HTTPException(status_code=507, detail=(
-            f"مساحة القرص لا تكفي لبناء نسخة الرفع ({free:.0f}MB متاح). "
-            "نزّل الـZIP مباشرة بدل الرفع."))
+# ─────────────── طابور الرفع إلى MEGA: متوالٍ + تلقائي (0.9.0) ───────────────
+MEGA_Q: list[dict[str, Any]] = []
+MEGA_Q_LOCK = threading.Lock()
+MEGA_WAKE = threading.Event()
+MEGA_STAT: dict[str, Any] = {"current": "", "current_name": "", "processed": 0,
+                             "errors": 0, "last_error": "", "started": time.time()}
 
+
+def _mega_pos_locked(col_id: str) -> int:
+    for i, it in enumerate(MEGA_Q, start=1):
+        if it["col"] == col_id:
+            return i
+    return 0
+
+
+def _mega_enqueue(col: "colls.Collection", sid: str, wipe: bool = False,
+                  auto: bool = False, backend: str = "mega") -> dict:
+    """يضع المجموعة في طابور الرفع. الترتيب = ترتيب الدخول ⇒ تتابع صارم."""
+    with MEGA_Q_LOCK:
+        if any(it["col"] == col.id for it in MEGA_Q):
+            return {"state": "queued", "position": _mega_pos_locked(col.id)}
+        if col.mega_state in ("uploading", "link", "done"):
+            return {"state": col.mega_state, "link": col.mega_link,
+                    "error": col.mega_error}
+        if backend == "telegram":
+            col.tg_state = "queued"
+            col.tg_error = ""
+            col.tg_percent = 0
+        else:
+            col.mega_state = "queued"
+            col.mega_error = ""
+            col.mega_percent = 0
+        col.mega_files_done = 0
+        col.mega_files_total = len(col.order)
+        col.note(("☁️ رفع تلقائي إلى MEGA — في الطابور…" if auto
+                  else "☁️ في طابور الرفع إلى MEGA…"))
+        if backend != "telegram":
+            col.mega_state = "queued"
+        MEGA_Q.append({"col": col.id, "sid": sid, "wipe": wipe, "auto": auto,
+                       "backend": backend, "at": time.time()})
+        pos = len(MEGA_Q)
+    MEGA_WAKE.set()
+    return {"state": "queued", "position": pos}
+
+
+def _mega_run(col: "colls.Collection", sid: str, wipe: bool = False) -> None:
+    """ينفّذ الرفع فعليًا (كان داخل خيط مستقل — الآن داخل المحرّك المتوالٍ)."""
+    sess = mega_up.session(sid) if sid else None
     zip_path = os.path.join(col.dir, "_mega_upload.zip")
     remote = (col.name or "notebooklm-audio") + ".zip"
     col.mega_state = "uploading"
@@ -1204,44 +1239,396 @@ def mega_upload_collection(col_id: str, owner: str = Depends(auth),
             except Exception:
                 pass
 
-    def worker() -> None:
+    try:
+        if col.delivery == "folder":
+            payload = [{"path": e["path"], "name": e["name"]}
+                       for e in col.order if os.path.exists(e.get("path", ""))]
+            col.mega_bytes = sum(int(e.get("size") or 0) for e in col.order)
+            col.note(f"☁️ رفع مجلد «{col.name}» ({len(payload)} ملف) إلى MEGA…")
+            cli = sess["client"] if sess is not None else None
+            mega_up.upload_folder(cli, payload, col.name, on_state)
+            if sess is not None and wipe:
+                mega_up.drop_session(sid)
+                col.note("🔒 مُسحت بيانات الجلسة من ذاكرة السيرفر")
+            return
+        files, size = mega_up.build_zip(zip_path, col.order)
+        col.mega_bytes = size
+        if files == 0:
+            raise RuntimeError("لا ملفات لبنائها في ZIP الرفع")
+        col.note(f"☁️ نسخة الرفع جاهزة ({size/1048576:.1f} م.ب) — جارٍ التشفير والرفع")
+        if sess is not None:
+            mega_up.upload_with(sess["client"], zip_path, remote, on_state)
+            sess["uploads"] = int(sess.get("uploads", 0)) + 1
+            if wipe and sess.get("uploads", 0) >= 1:
+                mega_up.drop_session(sid)
+                col.note("🔒 مُسحت بيانات الجلسة من ذاكرة السيرفر")
+        else:
+            mega_up.upload(zip_path, remote, on_state)
+    except Exception as e:                    # noqa: BLE001
+        col.mega_state = "error"
+        col.mega_error = f"{type(e).__name__}: {e}"[:300]
+        col.note("❌ فشل الرفع إلى MEGA: " + col.mega_error[:120])
         try:
-            if col.delivery == "folder":
-                payload = [{"path": e["path"], "name": e["name"]}
-                           for e in col.order if os.path.exists(e.get("path", ""))]
-                col.mega_bytes = sum(int(e.get("size") or 0) for e in col.order)
-                col.note(f"☁️ رفع مجلد «{col.name}» ({len(payload)} ملف) إلى MEGA…")
-                cli = mega_up.session(sid)["client"] if sess is not None else None
-                mega_up.upload_folder(cli, payload, col.name, on_state)
-                if sess is not None and (req.wipe_after if req else False):
-                    mega_up.drop_session(sid)
-                    col.note("🔒 مُسحت بيانات الجلسة من ذاكرة السيرفر")
-                return
-            files, size = mega_up.build_zip(zip_path, col.order)
-            col.mega_bytes = size
-            if files == 0:
-                raise RuntimeError("لا ملفات لبنائها في ZIP الرفع")
-            col.note(f"☁️ نسخة الرفع جاهزة ({size/1048576:.1f} م.ب) — جارٍ التشفير والرفع")
-            if sess is not None:
-                mega_up.upload_with(sess["client"], zip_path, remote, on_state)
-                sess["uploads"] = int(sess.get("uploads", 0)) + 1
-                if (req.wipe_after if req else False) and sess.get("uploads", 0) >= 1:
-                    mega_up.drop_session(sid)          # مسح الجلسة بعد الاستخدام
-                    col.note("🔒 مُسحت بيانات الجلسة من ذاكرة السيرفر")
-            else:
-                mega_up.upload(zip_path, remote, on_state)
-        except Exception as e:                    # noqa: BLE001
-            col.mega_state = "error"
-            col.mega_error = f"{type(e).__name__}: {e}"[:300]
-            col.note("❌ فشل الرفع إلى MEGA: " + col.mega_error[:120])
-            try:
-                if os.path.exists(zip_path):
-                    os.remove(zip_path)
-            except Exception:
-                pass
+            if os.path.exists(zip_path):
+                os.remove(zip_path)
+        except Exception:
+            pass
 
-    threading.Thread(target=worker, name="mega-prep", daemon=True).start()
-    return {"state": "uploading", "link": "", "error": ""}
+
+def _tg_run(col: "colls.Collection", sid: str) -> None:
+    """يرسل ملفات المجموعة المرتّبة إلى محادثة تيليجرام (بالترتيب)."""
+    sess = tg_up.session(sid) if sid else None
+    token = (sess or {}).get("token") or tg_up.TOKEN_ENV
+    chat = (sess or {}).get("chat") or tg_up.CHAT_ENV
+    if not token or not chat:
+        col.tg_state = "error"
+        col.tg_error = "لا جلسة تيليجرام صالحة — اربط البوت من التطبيق أولًا"
+        col.note("❌ " + col.tg_error)
+        return
+    col.tg_state = "uploading"
+    col.tg_percent = 0
+    col.tg_error = ""
+    col.tg_messages = []
+    col.tg_bytes = 0
+    col.tg_files_done = 0
+    col.tg_files_total = len(col.order)
+    col.tg_bot = (sess or {}).get("bot") or ""
+    t0 = time.time()
+    zip_path = os.path.join(col.dir, "_tg_upload.zip")
+    try:
+        if col.delivery == "folder":
+            payload = [(e["path"], e["name"]) for e in col.order
+                       if e.get("path") and os.path.exists(e["path"])]
+        else:
+            files, size = mega_up.build_zip(zip_path, col.order)
+            if files == 0:
+                raise RuntimeError("لا ملفات لإرسالها")
+            if size > tg_up.MAX_MB * 1048576:
+                raise RuntimeError(
+                    f"نسخة ZIP حجمها {size/1048576:.1f} م.ب وأقصى حد لتيليجرام "
+                    f"{tg_up.MAX_MB} م.ب — بدّل طريقة التسليم إلى «مجلد» ليُرسل ملفًا ملفًا.")
+            payload = [(zip_path, (col.name or "notebooklm-audio") + ".zip")]
+        if not payload:
+            raise RuntimeError("لا ملفات موجودة على القرص لإرسالها")
+        total = max(1, len(payload))
+        col.note(f"📨 إرسال {len(payload)} ملف إلى تيليجرام…"
+                 + (f" ({col.tg_bot})" if col.tg_bot else ""))
+        for i, (path, name) in enumerate(payload, start=1):
+            col.tg_current = name
+            r = tg_up.send_document(token, chat, path, name,
+                                    caption=f"{col.name} · {i}/{len(payload)}")
+            col.tg_messages.append({"name": name, "file_id": r["file_id"],
+                                    "message_id": r["message_id"],
+                                    "size": r["size"], "order": i})
+            col.tg_bytes += int(r["size"] or 0)
+            col.tg_files_done = i
+            col.tg_percent = int(i * 100 / total)
+            if sess:
+                sess["messages"] = int(sess.get("messages", 0)) + 1
+        col.tg_state = "done"
+        col.tg_percent = 100
+        col.tg_current = ""
+        col.tg_seconds = round(time.time() - t0, 1)
+        col.note(f"📨 تم إرسال {len(payload)} ملف إلى تيليجرام"
+                 + (f" (البوت @{col.tg_bot})" if col.tg_bot else ""))
+    except Exception as e:                    # noqa: BLE001
+        col.tg_state = "error"
+        col.tg_error = f"{type(e).__name__}: {e}"[:300]
+        col.note("❌ فشل الإرسال إلى تيليجرام: " + col.tg_error[:140])
+    finally:
+        try:
+            if os.path.exists(zip_path):
+                os.remove(zip_path)
+        except Exception:
+            pass
+
+
+def _mega_engine() -> None:
+    """خيط واحد: مجموعة واحدة ترفع في أي لحظة ⇒ لا تعارض ولا تزامن."""
+    while True:
+        MEGA_WAKE.wait(1.0)
+        MEGA_WAKE.clear()
+        while True:
+            with MEGA_Q_LOCK:
+                if not MEGA_Q:
+                    MEGA_STAT["current"] = ""
+                    MEGA_STAT["current_name"] = ""
+                    break
+                item = MEGA_Q[0]
+                col = colls.get(item["col"])
+                if col is None:
+                    MEGA_Q.pop(0)
+                    continue
+                MEGA_STAT["current"] = col.id
+                MEGA_STAT["current_name"] = col.name
+            try:
+                if (item.get("backend") or "mega") == "telegram":
+                    _tg_run(col, item.get("sid") or "")
+                else:
+                    _mega_run(col, item.get("sid") or "", bool(item.get("wipe")))
+                MEGA_STAT["processed"] = int(MEGA_STAT["processed"]) + 1
+            except Exception as exc:               # noqa: BLE001
+                MEGA_STAT["errors"] = int(MEGA_STAT["errors"]) + 1
+                MEGA_STAT["last_error"] = f"{type(exc).__name__}: {exc}"[:200]
+            finally:
+                with MEGA_Q_LOCK:
+                    if MEGA_Q and MEGA_Q[0] is item:
+                        MEGA_Q.pop(0)
+                    elif item in MEGA_Q:
+                        MEGA_Q.remove(item)
+                MEGA_STAT["current"] = ""
+                MEGA_STAT["current_name"] = ""
+
+
+def _auto_mega(col: "colls.Collection") -> None:
+    """يُنادى تلقائيًا عند جاهزية المجموعة — يرفع إلى السحابة المختارة بلا تطبيق."""
+    if not getattr(col, "auto_mega", False):
+        return
+    if not col.order:
+        return
+    if getattr(col, "cloud", "mega") == "telegram":
+        sid_tg = getattr(col, "tg_sid", "") or ""
+        if tg_up.session(sid_tg) is None and not tg_up.enabled():
+            col.note("⚠️ الرفع التلقائي متوقف: لا جلسة تيليجرام — اربط البوت من التطبيق.")
+            return
+        _mega_enqueue(col, sid_tg, False, auto=True, backend="telegram")
+        return
+    sid = getattr(col, "mega_sid", "") or ""
+    if not sid and not mega_up.enabled() and not mega_up.FAKE:
+        col.note("⚠️ الرفع التلقائي متوقف: لا جلسة MEGA — افتح الرفع من التطبيق مرة واحدة.")
+        return
+    if sid and mega_up.session(sid) is None and not mega_up.enabled() and not mega_up.FAKE:
+        col.note("⚠️ الرفع التلقائي متوقف: جلسة MEGA انتهت — أعد تسجيل الدخول من التطبيق.")
+        return
+    _mega_enqueue(col, sid, False, auto=True)
+
+
+@app.post("/collections/{col_id}/mega", status_code=202)
+def mega_upload_collection(col_id: str, owner: str = Depends(auth),
+                           req: MegaUploadReq | None = None) -> dict:
+    """يضع المجموعة في طابور الرفع إلى حساب MEGA (متوالٍ بالترتيب)."""
+    col = _own_collection(col_id, owner)
+    sid = (req.session_id if req else "") or getattr(col, "mega_sid", "") or ""
+    sess = mega_up.session(sid) if sid else None
+    if sess is None and not mega_up.enabled() and not mega_up.FAKE:
+        raise HTTPException(status_code=400, detail=(
+            "لا توجد بيانات ميجا: افتح رفع ميجا من التطبيق وأدخل بريدك مرة واحدة "
+            "(تُرسَل مشفّرة ولا تُخزَّن)، أو اضبط MEGA_EMAIL/MEGA_PASSWORD."))
+    if col.state not in ("done", "partial") or not col.order:
+        raise HTTPException(status_code=409, detail=(
+            "المجموعة لم تنتهِ بعد — سيبدأ رفعها تلقائيًا بمجرد انتهاء الترتيب."))
+    total = sum(int(e.get("size") or 0) for e in col.order) or 1
+    free = colls._disk_free_mb()
+    if free < (total / 1048576.0) * 1.25 + 40:
+        raise HTTPException(status_code=507, detail=(
+            f"مساحة القرص لا تكفي لبناء نسخة الرفع ({free:.0f}MB متاح). "
+            "نزّل الـZIP مباشرة بدل الرفع."))
+    if sid:
+        col.mega_sid = sid
+    return _mega_enqueue(col, sid, bool(req.wipe_after) if req else False)
+
+
+@app.post("/collections/{col_id}/mega/auto")
+def mega_auto(col_id: str, owner: str = Depends(auth),
+              req: MegaUploadReq | None = None) -> dict:
+    """تشغيل/إيقاف الرفع التلقائي لمجموعة (يُستخدم قبل انتهاء التنزيل)."""
+    col = _own_collection(col_id, owner)
+    sid = (req.session_id if req else "") or ""
+    if sid:
+        col.mega_sid = sid
+    return {"auto_mega": bool(getattr(col, "auto_mega", False)),
+            "armed": bool(col.mega_sid or mega_up.enabled() or mega_up.FAKE)}
+
+
+# ─────────────── Telegram Bot كسحابة ثانية (0.9.1) ───────────────
+@app.get("/tg/key")
+def tg_public_key(owner: str = Depends(auth)) -> dict:
+    if not tg_up.rsa_available():
+        raise HTTPException(503, "وحدة التشفير غير متاحة على السيرفر")
+    return {"alg": "RSA-OAEP-SHA1", "pubkey": tg_up.public_pem(),
+            "max_mb": tg_up.MAX_MB, "env_bot": tg_up.enabled()}
+
+
+@app.post("/tg/session")
+def tg_open_session(req: MegaSessionReq, owner: str = Depends(auth)) -> dict:
+    """يفك ظرف الهاتف: «token\nchat_id» ويختبرهما فعليًا ثم يفتح جلسة في الذاكرة."""
+    try:
+        token, chat = tg_up.open_sealed(req.sealed)
+    except Exception:
+        raise HTTPException(400, "تعذّر فك الظرف المشفّر — أعد المحاولة من التطبيق")
+    try:
+        sid = tg_up.create_session(token, chat)
+    except Exception as e:                    # noqa: BLE001
+        raise HTTPException(400, f"{e}")
+    s0 = tg_up.session(sid) or {}
+    return {"session_id": sid, "bot": s0.get("bot", ""), "chat": chat,
+            "chat_type": (s0.get("chat_info") or {}).get("type", ""),
+            "max_mb": tg_up.MAX_MB,
+            "expires_in_sec": tg_up.SESS_TTL}
+
+
+@app.get("/tg/session/{sid}")
+def tg_session_state(sid: str, owner: str = Depends(auth)) -> dict:
+    return {**tg_up.session_info(sid), "max_mb": tg_up.MAX_MB, "env": tg_up.env_info()}
+
+
+@app.delete("/tg/session/{sid}")
+def tg_close_session(sid: str, owner: str = Depends(auth)) -> dict:
+    return {"closed": tg_up.drop_session(sid)}
+
+
+@app.post("/collections/{col_id}/tg", status_code=202)
+def tg_upload_collection(col_id: str, owner: str = Depends(auth),
+                         req: MegaUploadReq | None = None) -> dict:
+    """يضع المجموعة في طابور الإرسال إلى تيليجرام (نفس الطابور المتوالٍ)."""
+    col = _own_collection(col_id, owner)
+    sid = (req.session_id if req else "") or getattr(col, "tg_sid", "") or ""
+    if tg_up.session(sid) is None and not tg_up.enabled():
+        raise HTTPException(400, detail=(
+            "لا جلسة تيليجرام: اربط البوت من التطبيق (توكن BotFather + معرّف المحادثة) "
+            "أو اضبط TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID على السيرفر."))
+    if col.state not in ("done", "partial") or not col.order:
+        raise HTTPException(409, "المجموعة لم تنتهِ بعد — سيُرسل تلقائيًا بعد انتهاء الترتيب.")
+    if sid:
+        col.tg_sid = sid
+    return _mega_enqueue(col, sid, False, backend="telegram")
+
+
+class CloudRequest(BaseModel):
+    cloud: str = "mega"          # mega | telegram
+    session_id: str = ""         # جلسة السحابة المختارة
+
+
+@app.post("/collections/{col_id}/cloud")
+def set_cloud(col_id: str, req: CloudRequest, owner: str = Depends(auth)) -> dict:
+    """يغيّر سحابة المجموعة بعد إنشائها (المستخدم يختار في خطوة السحابة)."""
+    col = _own_collection(col_id, owner)
+    col.cloud = "telegram" if str(req.cloud).lower() in ("telegram", "tg", "bot") else "mega"
+    if req.session_id:
+        if col.cloud == "telegram":
+            col.tg_sid = req.session_id
+        else:
+            col.mega_sid = req.session_id
+    if (col.state in ("done", "partial") and col.order
+            and getattr(col, "auto_mega", False)):
+        with MEGA_Q_LOCK:
+            queued = any(it["col"] == col.id for it in MEGA_Q)
+        if not queued:
+            if col.cloud == "telegram" and col.tg_state not in ("done", "uploading"):
+                _mega_enqueue(col, col.tg_sid, False, auto=True, backend="telegram")
+            elif col.cloud == "mega" and col.mega_state not in ("done", "uploading"):
+                _mega_enqueue(col, col.mega_sid, False, auto=True)
+    return {"cloud": col.cloud, "tg_session": bool(col.tg_sid),
+            "mega_session": bool(col.mega_sid)}
+
+
+@app.get("/collections/{col_id}/tg")
+def tg_state(col_id: str, request: Request, owner: str = Depends(auth)) -> dict:
+    col = _own_collection(col_id, owner)
+    base = _public_base(request)
+    links = []
+    for m in col.tg_messages:
+        idx = int(m.get("order") or 0)
+        links.append({
+            "name": m.get("name"),
+            "size": m.get("size"),
+            "url": f"{base}/tg/file/{col.id}/{idx}?t={sign_link('g', col.id + ':' + str(idx))}",
+        })
+    return {"state": col.tg_state, "percent": col.tg_percent,
+            "files_done": col.tg_files_done, "files_total": col.tg_files_total,
+            "current": col.tg_current, "error": col.tg_error,
+            "bytes": col.tg_bytes, "seconds": col.tg_seconds,
+            "bot": col.tg_bot, "links": links,
+            "max_mb": tg_up.MAX_MB,
+            "enabled": tg_up.enabled(),
+            "session_alive": tg_up.live_sessions() > 0}
+
+
+@app.get("/tg/file/{col_id}/{idx}")
+def tg_file(col_id: str, idx: int, t: str | None = None,
+            x_api_key: str | None = Header(default=None)):
+    """ينزّل ملفًا أُرسل إلى تيليجرام عبر السيرفر (رابط موقّع أو مفتاح API)."""
+    if t and check_link("g", col_id + ":" + str(idx), t):
+        col = colls.get(col_id)
+        if not col:
+            raise HTTPException(404, "المجموعة غير موجودة")
+    else:
+        col = _own_collection(col_id, auth(x_api_key))
+    msg = next((m for m in col.tg_messages if int(m.get("order") or 0) == idx), None)
+    if not msg or not msg.get("file_id"):
+        raise HTTPException(404, "الملف غير موجود في تيليجرام")
+    sess = tg_up.session(col.tg_sid) if col.tg_sid else None
+    token = (sess or {}).get("token") or tg_up.TOKEN_ENV
+    if not token:
+        raise HTTPException(409, "جلسة تيليجرام انتهت — أعد ربط البوت من التطبيق")
+    try:
+        stream, size = tg_up.download_stream(token, msg["file_id"])
+    except Exception as e:                    # noqa: BLE001
+        raise HTTPException(502, f"تعذّر التنزيل من تيليجرام: {e}")
+    name = msg.get("name") or "file"
+    headers = {"Content-Disposition": cd_header(name), "Cache-Control": "no-store"}
+    if size:
+        headers["Content-Length"] = str(size)
+    return StreamingResponse(stream, media_type="application/octet-stream", headers=headers)
+
+
+@app.get("/queue")
+def global_queue(owner: str = Depends(auth)) -> dict:
+    """حالة الطابور العامة: ما يُعالَج الآن، وما يليه — لكل المساحات."""
+    with MEGA_Q_LOCK:
+        up_order = [it["col"] for it in MEGA_Q]
+        current = MEGA_STAT["current"]
+    cols = [c for c in colls.COLS.values() if c.owner == owner]
+    cols.sort(key=lambda c: c.created_at)
+    items = []
+    for c in cols:
+        phase = "queued"
+        if c.state in ("pending", "running", "waiting_order"):
+            phase = "processing"
+        elif c.state == "sorting":
+            phase = "sorting"
+        elif c.state in ("done", "partial"):
+            st_cloud = c.tg_state if getattr(c, "cloud", "mega") == "telegram" else c.mega_state
+            if st_cloud in ("queued", "uploading", "link", "done", "error"):
+                phase = ("uploading" if st_cloud in ("uploading", "link")
+                         else ("uploaded" if st_cloud == "done"
+                               else ("upload_error" if st_cloud == "error" else "upload_queued")))
+            else:
+                phase = "ready"
+        pos = up_order.index(c.id) + 1 if c.id in up_order else 0
+        items.append({
+            "id": c.id, "name": c.name, "phase": phase, "state": c.state,
+            "total": len(c.items),
+            "done": sum(1 for i in c.items if i.state == "done"),
+            "errors": sum(1 for i in c.items if i.state == "error"),
+            "queue_position": pos,
+            "is_current": c.id == current,
+            "auto_mega": bool(getattr(c, "auto_mega", False)),
+            "cloud": getattr(c, "cloud", "mega"),
+            "tg_state": c.tg_state, "tg_percent": c.tg_percent,
+            "tg_files_done": c.tg_files_done, "tg_files_total": c.tg_files_total,
+            "mega_state": c.mega_state, "mega_percent": c.mega_percent,
+            "mega_files_done": c.mega_files_done,
+            "mega_files_total": c.mega_files_total,
+            "mega_current": c.mega_current, "mega_error": c.mega_error,
+            "link": c.mega_link, "folder_link": c.mega_folder_link,
+            "created": c.created_at,
+        })
+    busy = sum(1 for i in items if i["phase"] in ("processing", "sorting", "uploading"))
+    return {
+        "engine": {
+            "current": current,
+            "current_name": MEGA_STAT["current_name"],
+            "waiting": max(0, len(up_order) - (1 if current else 0)),
+            "processed": MEGA_STAT["processed"],
+            "errors": MEGA_STAT["errors"],
+            "last_error": MEGA_STAT["last_error"],
+            "busy": busy,
+            "sequential": True,
+        },
+        "items": items,
+        "total": len(items),
+    }
 
 
 @app.get("/collections/{col_id}/mega")

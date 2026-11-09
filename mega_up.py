@@ -22,6 +22,12 @@ EMAIL = (os.environ.get("MEGA_EMAIL") or "").strip()
 PASSWORD = os.environ.get("MEGA_PASSWORD") or ""
 FOLDER = (os.environ.get("MEGA_FOLDER") or "NoteWorm").strip() or "NoteWorm"
 
+FAKE = (os.environ.get("NW_FAKE_MEGA") or "").strip().lower() in ("1", "true", "yes")
+ATTEMPTS = max(1, int(os.environ.get("MEGA_ATTEMPTS") or 3))
+CONNECT_TIMEOUT = max(5, int(os.environ.get("MEGA_CONNECT_TIMEOUT") or 30))
+READ_TIMEOUT = max(30, int(os.environ.get("MEGA_READ_TIMEOUT") or 300))
+PART_RETRY_SLEEP = max(0.0, float(os.environ.get("MEGA_RETRY_SLEEP") or 2.0))
+
 _LOCK = threading.Lock()
 _CLIENT: Any = None
 _CLIENT_AT = 0.0
@@ -38,6 +44,38 @@ SESSION_TTL = 25 * 60          # جلسة ميجا ~25 دقيقة ثم نعيد 
 _LIB_DIR = os.environ.get("MEGA_LIB_DIR") or os.path.join(
     os.environ.get("WORK_DIR", "/tmp/nlm"), "megalib")
 _lib_state = {"tried": False, "ok": False, "error": ""}
+
+
+_TIMEOUTS_PATCHED = False
+
+
+def install_net_timeouts() -> None:
+    """mega.py يستخدم requests بلا أي timeout ⇒ اتصال «ميت» يعلّق الرفع للأبد.
+
+    نضيف مهلة افتراضية (اتصال 30s / قراءة 300s) لكل طلب لم يُحدد له timeout،
+    فيتحول التعليق إلى استثناء قابل لإعادة المحاولة.
+    """
+    global _TIMEOUTS_PATCHED
+    if _TIMEOUTS_PATCHED:
+        return
+    try:
+        import requests
+
+        def _wrap(original):
+            def request(self, method, url, **kw):
+                if kw.get("timeout") is None:
+                    kw["timeout"] = (CONNECT_TIMEOUT, READ_TIMEOUT)
+                return original(self, method, url, **kw)
+            return request
+
+        requests.Session.request = _wrap(requests.Session.request)
+        try:
+            requests.api.request = _wrap(requests.api.request)
+        except Exception:
+            pass
+        _TIMEOUTS_PATCHED = True
+    except Exception:
+        pass
 
 
 def _shims() -> None:
@@ -57,6 +95,8 @@ def _shims() -> None:
 def _import_mega() -> Any:
     _shims()
     try:
+        _shims()
+        install_net_timeouts()
         from mega import Mega          # noqa: F401
         _lib_state.update(tried=True, ok=True, error="")
         return Mega
@@ -171,6 +211,28 @@ def _folder(m: Any) -> Any:
     return None
 
 
+def _fake_link(kind: str, name: str) -> str:
+    import hashlib
+    h = hashlib.sha1(name.encode("utf-8")).hexdigest()[:10].upper()
+    return f"https://mega.nz/{kind}/{h}"
+
+
+def _friendly_upload_error(exc: BaseException) -> str:
+    msg = f"{type(exc).__name__}: {exc}"
+    low = msg.lower()
+    if "timeout" in low or "timed out" in low or "readtimeout" in low:
+        return "انقطعت الاستجابة من MEGA (timeout) — أُعيدت المحاولة تلقائيًا"
+    if "connection" in low or "reset" in low or "broken pipe" in low:
+        return "انقطع الاتصال بـ MEGA أثناء الرفع — أُعيدت المحاولة تلقائيًا"
+    if "-3" in low or "eagain" in low or "rate" in low:
+        return "MEGA رفض الطلب مؤقتًا (EAGAIN) — أُعيدت المحاولة تلقائيًا"
+    if "enoent" in low or "object (typically" in low:
+        return "مسار الحفظ على MEGA غير صالح (ENOENT -11)"
+    if "password" in low or "credentials" in low or "login" in low:
+        return "بيانات دخول MEGA غير صحيحة"
+    return msg[:300]
+
+
 def upload(path: str, remote_name: str,
            on_state: Callable[..., None],
            client: Any = None) -> threading.Thread:
@@ -180,19 +242,49 @@ def upload(path: str, remote_name: str,
         t0 = time.time()
         try:
             on_state(state="uploading", percent=0)
+            if FAKE:
+                time.sleep(0.05)
+                link = _fake_link("file", remote_name)
+                on_state(state="done", percent=100, link=link, folder_link=link,
+                         seconds=round(time.time() - t0, 1))
+                return
             m = client if client is not None else _client()
             dest = _folder(m)
-            try:
-                handle = m.upload(path, dest, dest_filename=remote_name)
-            except Exception as first:               # noqa: BLE001
-                low = str(first).lower()
-                if dest and ("enoent" in low or "-11" in low or "not found" in low):
-                    on_state(state="uploading", percent=0,
-                             error="مجلد MEGA غير متاح — نرفع إلى الجذر")
-                    dest = None
-                    handle = m.upload(path, None, dest_filename=remote_name)
-                else:
-                    raise
+            handle = None
+            last: BaseException | None = None
+            for attempt in range(1, ATTEMPTS + 1):
+                try:
+                    handle = m.upload(path, dest, dest_filename=remote_name)
+                    last = None
+                    break
+                except Exception as first:               # noqa: BLE001
+                    last = first
+                    low = str(first).lower()
+                    if dest and ("enoent" in low or "-11" in low or "not found" in low):
+                        on_state(state="uploading", percent=0,
+                                 error="مجلد MEGA غير متاح — نرفع إلى الجذر")
+                        dest = None
+                        try:
+                            handle = m.upload(path, None, dest_filename=remote_name)
+                            last = None
+                            break
+                        except Exception as second:      # noqa: BLE001
+                            last = second
+                        continue
+                    if attempt < ATTEMPTS:
+                        on_state(state="uploading", percent=0,
+                                 error=f"إعادة المحاولة {attempt + 1}/{ATTEMPTS} — "
+                                       + _friendly_upload_error(first))
+                        time.sleep(PART_RETRY_SLEEP * attempt)
+                        if client is None:
+                            try:
+                                _reset()
+                                m = _client()
+                                dest = _folder(m)
+                            except Exception:
+                                pass
+            if last is not None:
+                raise last
             link = ""
             try:
                 link = m.get_upload_link(handle) or ""
@@ -213,14 +305,9 @@ def upload(path: str, remote_name: str,
             on_state(state="done", percent=100, link=link, folder_link=fl,
                      seconds=round(time.time() - t0, 1))
         except Exception as e:                       # noqa: BLE001
-            _reset()
-            msg = f"{type(e).__name__}: {e}"
-            low = msg.lower()
-            if "enoent" in low or "object (typically" in low:
-                msg = "تعذّر رفع الملف إلى MEGA: مسار الحفظ غير صالح (ENOENT -11)"
-            elif "password" in low or "credentials" in low or "login" in low:
-                msg = "بيانات دخول ميجا غير صحيحة (MEGA_EMAIL / MEGA_PASSWORD)"
-            on_state(state="error", percent=0, error=msg[:300],
+            if client is None:
+                _reset()
+            on_state(state="error", percent=0, error=_friendly_upload_error(e)[:300],
                      seconds=round(time.time() - t0, 1))
 
     t = threading.Thread(target=worker, name="mega-upload", daemon=True)
@@ -396,23 +483,44 @@ def upload_folder(client: Any, files: list[dict], folder_name: str,
                   on_state: Callable[..., None]) -> threading.Thread:
     """يرفع الملفات داخل: مجلد باسم الدفتر ← مجلد «تم الترتيب» ← الملفات.
 
-    - لا رفع إلى جذر الحساب إطلاقًا (كان سبب تناثر الملفات في الجذر).
-    - يستأنف بلا تكرار: يتخطى ما هو موجود بنفس الاسم والحجم.
-    - يبلّغ بالتقدم: percent + files_done/files_total + current.
+    إصلاح 0.9.0 (سبب «توقف الرفع في المنتصف» + «فشل timeout»):
+    - كل ملف يُعاد رفعُه حتى ATTEMPTS مرات بمهلة قصيرة بينها، فلا يُسقط ملف واحد
+      الدفعة كلها كما كان يحدث قبلًا.
+    - مهلات شبكة حقيقية (install_net_timeouts) فلا تعليق بلا نهاية.
+    - إن كان العميل من متغيرات البيئة نُعيد تسجيل الدخول بعد الفشل ونتابع.
+    - يتخطى ما هو موجود بنفس الاسم والحجم (استئناف بلا تكرار).
     """
 
     def worker() -> None:
         t0 = time.time()
+        total = max(1, len(files))
+        done = 0
+        skipped = 0
+        failed: list[str] = []
         try:
             on_state(state="uploading", percent=0, files_done=0, files_total=len(files),
                      current="")
+            if FAKE:
+                for i, f in enumerate(files, start=1):
+                    if i % 2 == 0:
+                        on_state(state="uploading", percent=int((i - 1) * 100 / total),
+                                 files_done=i - 1, files_total=total,
+                                 current=f"محاولة سابقة: {f.get('name')}")
+                        time.sleep(0.15)
+                    on_state(state="uploading", percent=int(i * 100 / total),
+                             files_done=i, files_total=total, current=f.get("name") or "")
+                    time.sleep(0.25)
+                link = _fake_link("folder", folder_name)
+                on_state(state="done", percent=100, link=link, folder_link=link,
+                         files_done=len(files), files_total=total, skipped=0,
+                         folder=folder_name, subfolder=SORTED_NAME, current="",
+                         seconds=round(time.time() - t0, 1))
+                return
+
             m = client if client is not None else _client()
             parent = _folder(m)                      # مجلد NoteWorm (قد يكون None)
             root = _ensure_folder(m, folder_name, parent)
             inner = _ensure_folder(m, SORTED_NAME, root)
-            total = max(1, len(files))
-            done = 0
-            skipped = 0
             existing = _children(m, inner)
             for f in files:
                 path = f.get("path")
@@ -425,7 +533,34 @@ def upload_folder(client: Any, files: list[dict], folder_name: str,
                 if existing.get(name) == size:
                     skipped += 1
                 else:
-                    m.upload(path, inner, dest_filename=name)
+                    last: BaseException | None = None
+                    for attempt in range(1, ATTEMPTS + 1):
+                        try:
+                            m.upload(path, inner, dest_filename=name)
+                            last = None
+                            break
+                        except BaseException as exc:      # noqa: BLE001
+                            last = exc
+                            if attempt < ATTEMPTS:
+                                on_state(state="uploading",
+                                         percent=int(done * 100 / total),
+                                         files_done=done, files_total=total,
+                                         current=f"{name} — إعادة المحاولة {attempt + 1}/{ATTEMPTS}")
+                                time.sleep(PART_RETRY_SLEEP * attempt)
+                                if client is None:
+                                    try:
+                                        _reset()
+                                        m = _client()
+                                        root = _ensure_folder(m, folder_name, parent)
+                                        inner = _ensure_folder(m, SORTED_NAME, root)
+                                        existing = _children(m, inner)
+                                    except Exception:
+                                        pass
+                    if last is not None:
+                        failed.append(name)
+                        on_state(state="uploading", percent=int(done * 100 / total),
+                                 files_done=done, files_total=total, current=name,
+                                 error=f"تعذّر رفع {name}: {_friendly_upload_error(last)}")
                 done += 1
                 on_state(state="uploading", percent=int(done * 100 / total),
                          files_done=done, files_total=total, current=name)
@@ -439,12 +574,18 @@ def upload_folder(client: Any, files: list[dict], folder_name: str,
                 inner_link = m.get_folder_link(inner) or ""
             except Exception:
                 inner_link = ""
-            on_state(state="done", percent=100, link=link or inner_link,
-                     folder_link=link or inner_link, files_done=done, files_total=total,
-                     skipped=skipped, folder=folder_name, subfolder=SORTED_NAME,
-                     current="", seconds=round(time.time() - t0, 1))
+            ok = done - len(failed)
+            on_state(state="done" if ok > 0 else "error",
+                     percent=100 if ok > 0 else 0,
+                     link=link or inner_link, folder_link=link or inner_link,
+                     files_done=done, files_total=total, skipped=skipped,
+                     folder=folder_name, subfolder=SORTED_NAME, current="",
+                     error=("" if not failed else
+                            f"فشل رفع {len(failed)} ملف بعد {ATTEMPTS} محاولات: "
+                            + "، ".join(failed[:5])),
+                     seconds=round(time.time() - t0, 1))
         except Exception as e:                       # noqa: BLE001
-            on_state(state="error", percent=0, error=f"{type(e).__name__}: {e}"[:300],
+            on_state(state="error", percent=0, error=_friendly_upload_error(e),
                      current="", seconds=round(time.time() - t0, 1))
 
     t = threading.Thread(target=worker, name="mega-folder", daemon=True)

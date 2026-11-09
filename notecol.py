@@ -22,7 +22,7 @@ import time
 import unicodedata
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import media
 import zipstream
@@ -144,6 +144,22 @@ class Collection:
     mega_seconds: float = 0.0
     # طريقة التسليم: zip = ملف واحد مضغوط · folder = مجلد باسم الدفتر
     delivery: str = "zip"
+    # الرفع التلقائي (0.9.0): يُشغَّل تلقائيًا بعد اكتمال الترتيب
+    auto_mega: bool = False
+    mega_sid: str = ""
+    # السحابة المختارة: mega | telegram (0.9.1)
+    cloud: str = "mega"
+    tg_sid: str = ""
+    tg_state: str = "idle"        # idle|queued|uploading|done|error
+    tg_error: str = ""
+    tg_percent: int = 0
+    tg_files_done: int = 0
+    tg_files_total: int = 0
+    tg_current: str = ""
+    tg_bytes: int = 0
+    tg_seconds: float = 0.0
+    tg_bot: str = ""
+    tg_messages: list[dict] = field(default_factory=list)
     sort_seconds: float = 0.0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _zip: tuple[list[zipstream.Entry], int] | None = field(default=None, repr=False)
@@ -413,6 +429,20 @@ def build_order(col: Collection) -> list[Item]:
     return ordered + rest
 
 
+# يُسجّله main.py: يُنادى تلقائيًا حين تصبح المجموعة جاهزة (done/partial)
+ON_READY: "Callable[[Collection], None] | None" = None
+
+
+def _notify_ready(col: "Collection") -> None:
+    cb = ON_READY
+    if cb is None:
+        return
+    try:
+        cb(col)
+    except Exception:            # noqa: BLE001
+        pass
+
+
 def start_finalize(col: Collection) -> bool:
     with col._lock:
         if col.state in ("sorting",):
@@ -469,6 +499,7 @@ def _finalize(col: Collection) -> None:
         else:
             col.note(f"🗜️ ZIP جاهز · {len(entries)} ملف · "
                      f"{sum(e['size'] for e in entries)/1048576:.1f} م.ب")
+        _notify_ready(col)                 # ⇒ رفع MEGA تلقائي إن كان مطلوبًا
     except Exception as e:                    # noqa: BLE001
         col.state = "partial"
         col.error = f"{type(e).__name__}: {e}"
@@ -477,13 +508,19 @@ def _finalize(col: Collection) -> None:
 
 # ─────────────────────────────── API ───────────────────────────────
 def create(owner: str, name: str, items: Iterable[dict], order_text: str = "",
-           match: float | None = None, delivery: str = "zip") -> Collection:
+           match: float | None = None, delivery: str = "zip",
+           auto_mega: bool = False, mega_sid: str = "",
+           cloud: str = "mega", tg_sid: str = "") -> Collection:
     os.makedirs(COLS_DIR, exist_ok=True)
     col = Collection(id=uuid.uuid4().hex[:12], owner=owner,
                      name=media.safe_name(name, 0, "notebooklm-audio"))
     col.match = min(0.80, max(0.50, float(match if match is not None else MATCH_DEFAULT)))
     col.order_text = order_text or ""
     col.delivery = "folder" if str(delivery).lower() in ("folder", "dir", "directory") else "zip"
+    col.auto_mega = bool(auto_mega)
+    col.mega_sid = str(mega_sid or "")
+    col.cloud = "telegram" if str(cloud or "").lower() in ("telegram", "tg", "bot") else "mega"
+    col.tg_sid = str(tg_sid or "")
     for idx, raw in enumerate(items):
         if idx >= MAX_ITEMS:
             break
